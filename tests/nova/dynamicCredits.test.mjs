@@ -17,7 +17,9 @@ import {
   releaseReservation,
   recoverSettlement,
   recoverStaleSettlingReservations,
+  expireStaleReservations,
   isClientTransactionCapable,
+  isCurrentCycle,
 } from "../../src/lib/nova/reservationEngine.ts";
 import {
   routeModelForTier,
@@ -51,6 +53,8 @@ class DynamicFakeCollection {
         if ("$in" in value && !value.$in.includes(actual)) return false;
         if ("$gte" in value && actual < value.$gte) return false;
         if ("$lte" in value && actual > value.$lte) return false;
+        if ("$lt" in value && actual >= value.$lt) return false;
+        if ("$gt" in value && actual <= value.$gt) return false;
         continue;
       }
       if (actual !== value) return false;
@@ -1553,5 +1557,727 @@ test("Phase 1.5 - Test 8: Unknown topology type causes TRANSACTION_UNAVAILABLE w
 
   const resDoc = await db.collection("nova_credit_reservations").findOne({ reservationId: reservation.reservationId });
   assert.equal(resDoc.status, "SETTLING");
+});
+
+// =============================================================
+// Phase 2.2: Daily Accounting Remediation Tests
+// =============================================================
+
+// Helper: force a rolling daily reset by rewinding the allocation anchor by >24h.
+async function forceDailyReset(db, userId, plan = { plan: "FREE" }) {
+  const walletCol = db.collection("nova_user_wallets");
+  await walletCol.updateOne(
+    { userId },
+    { $set: { lastDailyAllocationAt: new Date(Date.now() - 25 * 3600 * 1000) } }
+  );
+  return reconcileAndGetWallet(db, userId, plan);
+}
+
+// -------------------------------------------------------------
+// 2.2 Test 1: Old-cycle reservation settles after reset without consuming new daily allowance
+// -------------------------------------------------------------
+test("2.2-1: Reservation created before reset, settled after reset, does not consume the new day's allowance", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-1", { plan: "BUILDER", status: "ACTIVE", expiryDate: new Date(Date.now() + 86400000 * 30) });
+
+  const reservation = await reserveCredits(db, {
+    userId: "s22-1",
+    conversationId: "conv-22-1",
+    estimatedCredits: 10,
+  });
+  assert.equal(reservation.success, true);
+
+  // Record anchor at creation time, then force a daily reset.
+  const walletBefore = await reconcileAndGetWallet(db, "s22-1");
+  const anchorAtCreation = walletBefore.lastDailyAllocationAt;
+
+  const walletAfterReset = await forceDailyReset(db, "s22-1", { plan: "BUILDER", status: "ACTIVE", expiryDate: new Date(Date.now() + 86400000 * 30) });
+  assert.equal(walletAfterReset.dailyRemaining, 950); // replenished
+  assert.equal(walletAfterReset.reservedCredits, 0); // old-cycle holds released from daily pool
+
+  // Settle the OLD reservation after reset. Actual ~3 credits.
+  const settle = await settleReservation(db, {
+    reservationId: reservation.reservationId,
+    userId: "s22-1",
+    conversationId: "conv-22-1",
+    provider: "gemini",
+    model: "gemini-2.5-flash",
+    tokens: { inputTokens: 2000, outputTokens: 500 }, // ~3 credits
+  });
+  assert.equal(settle.success, true);
+  assert.equal(settle.creditsCharged, 3);
+
+  const walletFinal = await reconcileAndGetWallet(db, "s22-1");
+  // New day's allowance must NOT be reduced by the old-cycle reservation.
+  assert.equal(walletFinal.dailyRemaining, 950);
+  assert.equal(walletFinal.dailyUsed, 0);
+  // Usage still counts toward the monthly accounting period.
+  assert.equal(walletFinal.monthlyUsed, 3);
+  // Reservation hold fully released.
+  assert.equal(walletFinal.reservedCredits, 0);
+  assert.equal(walletFinal.reservedMonthlyCredits, 0);
+  assert.notEqual(new Date(anchorAtCreation).getTime(), new Date(walletFinal.lastDailyAllocationAt).getTime());
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 2: Old-cycle reservation releases without reducing new-cycle reserved credits
+// -------------------------------------------------------------
+test("2.2-2: Releasing an old-cycle reservation never decrements the new cycle's reserved balance", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-2", { plan: "BUILDER", status: "ACTIVE", expiryDate: new Date(Date.now() + 86400000 * 30) });
+
+  const oldRes = await reserveCredits(db, { userId: "s22-2", conversationId: "conv-22-2a", estimatedCredits: 10 });
+  assert.equal(oldRes.success, true);
+
+  // Force reset (old cycle => daily hold released).
+  await forceDailyReset(db, "s22-2", { plan: "BUILDER", status: "ACTIVE", expiryDate: new Date(Date.now() + 86400000 * 30) });
+
+  // Create a NEW-cycle reservation.
+  const newRes = await reserveCredits(db, { userId: "s22-2", conversationId: "conv-22-2b", estimatedCredits: 5 });
+  assert.equal(newRes.success, true);
+
+  const walletMid = await reconcileAndGetWallet(db, "s22-2");
+  assert.equal(walletMid.reservedCredits, 5); // only the new-cycle reservation holds daily credits
+
+  // Release the OLD reservation. Must not reduce the new cycle's reserved balance.
+  const released = await releaseReservation(db, oldRes.reservationId, "s22-2", "EXECUTION_ABORTED");
+  assert.equal(released, true);
+
+  const walletFinal = await reconcileAndGetWallet(db, "s22-2");
+  assert.equal(walletFinal.reservedCredits, 5); // unchanged
+  assert.equal(walletFinal.reservedMonthlyCredits, 5); // old monthly hold released, new held
+  assert.equal(walletFinal.dailyRemaining, 950); // daily untouched
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 3: New-cycle reservations remain correctly accounted when old-cycle reservations settle
+// -------------------------------------------------------------
+test("2.2-3: New-cycle reservations remain correctly accounted while old-cycle reservations settle", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-3", { plan: "FREE" });
+
+  const oldRes = await reserveCredits(db, { userId: "s22-3", conversationId: "conv-22-3a", estimatedCredits: 5 });
+  assert.equal(oldRes.success, true);
+
+  await forceDailyReset(db, "s22-3", { plan: "FREE" });
+
+  const newRes = await reserveCredits(db, { userId: "s22-3", conversationId: "conv-22-3b", estimatedCredits: 5 });
+  assert.equal(newRes.success, true);
+
+  // Settle the OLD reservation.
+  const settleOld = await settleReservation(db, {
+    reservationId: oldRes.reservationId,
+    userId: "s22-3",
+    conversationId: "conv-22-3a",
+    provider: "gemini",
+    model: "gemini-2.5-flash",
+    tokens: { inputTokens: 2000, outputTokens: 500 },
+  });
+  assert.equal(settleOld.success, true);
+
+  const wallet = await reconcileAndGetWallet(db, "s22-3");
+  // New-cycle reserved balance untouched by old-cycle settlement.
+  assert.equal(wallet.reservedCredits, 5);
+  // Old cycle settled (monthly hold released), new cycle still held.
+  assert.equal(wallet.reservedMonthlyCredits, 5);
+  // Old-cycle usage counted monthly, not daily.
+  assert.equal(wallet.monthlyUsed, 3);
+  assert.equal(wallet.dailyUsed, 0);
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 4: Overage absorbed once at reset
+// -------------------------------------------------------------
+test("2.2-4: Unbilled overage is absorbed once against the new daily allowance", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-4", { plan: "FREE" });
+
+  // Inject 30 overage on a 25/day tier.
+  const walletCol = db.collection("nova_user_wallets");
+  await walletCol.updateOne({ userId: "s22-4" }, { $set: { unbilledOverage: 30 } });
+
+  const wallet = await forceDailyReset(db, "s22-4", { plan: "FREE" });
+  // overageApplied = min(25,30)=25 => dailyRemaining=0, remaining overage=5.
+  assert.equal(wallet.dailyRemaining, 0);
+  assert.equal(wallet.unbilledOverage, 5);
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 5: Overage exceeding one day's allowance carries forward
+// -------------------------------------------------------------
+test("2.2-5: Overage exceeding one day's allowance carries forward across cycles", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-5", { plan: "FREE" });
+
+  const walletCol = db.collection("nova_user_wallets");
+  await walletCol.updateOne({ userId: "s22-5" }, { $set: { unbilledOverage: 80 } });
+
+  // First reset: absorb 25, carry 55.
+  const w1 = await forceDailyReset(db, "s22-5", { plan: "FREE" });
+  assert.equal(w1.dailyRemaining, 0);
+  assert.equal(w1.unbilledOverage, 55);
+
+  // Second reset: absorb 25, carry 30.
+  const w2 = await forceDailyReset(db, "s22-5", { plan: "FREE" });
+  assert.equal(w2.dailyRemaining, 0);
+  assert.equal(w2.unbilledOverage, 30);
+
+  // Third reset: absorb 25, carry 5.
+  const w3 = await forceDailyReset(db, "s22-5", { plan: "FREE" });
+  assert.equal(w3.dailyRemaining, 0);
+  assert.equal(w3.unbilledOverage, 5);
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 6: Repeated reconciliation and multiple resets never double-deduct overage
+// -------------------------------------------------------------
+test("2.2-6: Repeated reconciliation never applies the same overage twice", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-6", { plan: "FREE" });
+
+  const walletCol = db.collection("nova_user_wallets");
+  await walletCol.updateOne({ userId: "s22-6" }, { $set: { unbilledOverage: 10 } });
+
+  const w1 = await forceDailyReset(db, "s22-6", { plan: "FREE" });
+  assert.equal(w1.dailyRemaining, 15);
+  assert.equal(w1.unbilledOverage, 0);
+
+  // Reconcile repeatedly with no additional time passage -> no double deduction.
+  const w2 = await reconcileAndGetWallet(db, "s22-6", { plan: "FREE" });
+  const w3 = await reconcileAndGetWallet(db, "s22-6", { plan: "FREE" });
+  assert.equal(w2.dailyRemaining, 15);
+  assert.equal(w3.dailyRemaining, 15);
+  assert.equal(w2.unbilledOverage, 0);
+  assert.equal(w3.unbilledOverage, 0);
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 7: Expired RESERVED reservation releases credits exactly once
+// -------------------------------------------------------------
+test("2.2-7: Expired RESERVED reservation releases its hold exactly once", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-7", { plan: "FREE" });
+
+  const reservation = await reserveCredits(db, { userId: "s22-7", conversationId: "conv-22-7", estimatedCredits: 5 });
+  assert.equal(reservation.success, true);
+
+  const resCol = db.collection("nova_credit_reservations");
+  await resCol.updateOne({ reservationId: reservation.reservationId }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+
+  const first = await expireStaleReservations(db, { userId: "s22-7" });
+  assert.equal(first.expiredCount, 1);
+
+  const wallet = await reconcileAndGetWallet(db, "s22-7");
+  assert.equal(wallet.reservedCredits, 0);
+  assert.equal(wallet.reservedMonthlyCredits, 0);
+
+  const resDoc = await resCol.findOne({ reservationId: reservation.reservationId });
+  assert.equal(resDoc.status, "EXPIRED");
+
+  // Second sweep must not release again.
+  const second = await expireStaleReservations(db, { userId: "s22-7" });
+  assert.equal(second.expiredCount, 0);
+  const wallet2 = await reconcileAndGetWallet(db, "s22-7");
+  assert.equal(wallet2.reservedMonthlyCredits, 0);
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 8: Concurrent expiration workers cannot double-release
+// -------------------------------------------------------------
+test("2.2-8: Concurrent expiration workers cannot release the same reservation twice", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-8", { plan: "FREE" });
+
+  const reservation = await reserveCredits(db, { userId: "s22-8", conversationId: "conv-22-8", estimatedCredits: 5 });
+  assert.equal(reservation.success, true);
+
+  const resCol = db.collection("nova_credit_reservations");
+  await resCol.updateOne({ reservationId: reservation.reservationId }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+
+  const [r1, r2] = await Promise.all([
+    expireStaleReservations(db, { userId: "s22-8" }),
+    expireStaleReservations(db, { userId: "s22-8" }),
+  ]);
+
+  assert.ok(r1.expiredCount <= 1 && r2.expiredCount <= 1);
+  assert.equal(r1.expiredCount + r2.expiredCount, 1);
+
+  const wallet = await reconcileAndGetWallet(db, "s22-8");
+  assert.equal(wallet.reservedMonthlyCredits, 0);
+  assert.equal(wallet.reservedCredits, 0);
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 9: SETTLING reservations are not expired
+// -------------------------------------------------------------
+test("2.2-9: SETTLING reservations with past expiry are never expired", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-9", { plan: "FREE" });
+
+  const reservation = await reserveCredits(db, { userId: "s22-9", conversationId: "conv-22-9", estimatedCredits: 5 });
+  assert.equal(reservation.success, true);
+
+  const resCol = db.collection("nova_credit_reservations");
+  await resCol.updateOne(
+    { reservationId: reservation.reservationId },
+    {
+      $set: {
+        status: "SETTLING",
+        expiresAt: new Date(Date.now() - 1000),
+        provider: "gemini",
+        model: "gemini-2.5-flash",
+        tokens: { inputTokens: 2000, outputTokens: 500 },
+      },
+    }
+  );
+
+  const result = await expireStaleReservations(db, { userId: "s22-9" });
+  assert.equal(result.expiredCount, 0);
+
+  const resDoc = await resCol.findOne({ reservationId: reservation.reservationId });
+  assert.equal(resDoc.status, "SETTLING");
+
+  // SETTLING stays recoverable.
+  const recovered = await recoverSettlement(db, reservation.reservationId, "s22-9");
+  assert.equal(recovered.success, true);
+  assert.ok(!recovered.alreadySettled); // first-time settlement, not a duplicate
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 9b: Expiration fails closed when transactions are unavailable
+// -------------------------------------------------------------
+test("2.2-9b: Expiration fails closed on non-transaction-capable topology without changing status or wallet balances", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-9b", { plan: "FREE" });
+
+  const reservation = await reserveCredits(db, { userId: "s22-9b", conversationId: "conv-22-9b", estimatedCredits: 5 });
+  assert.equal(reservation.success, true);
+
+  const resCol = db.collection("nova_credit_reservations");
+  await resCol.updateOne({ reservationId: reservation.reservationId }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+
+  // Simulate a standalone (Single) topology: transactions are unavailable.
+  db.topology = { description: { type: "Single" } };
+
+  const result = await expireStaleReservations(db, { userId: "s22-9b" });
+  assert.equal(result.expiredCount, 0);
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0].error, /TRANSACTION_UNAVAILABLE/);
+
+  // Fail closed: reservation must still be RESERVED (not EXPIRED).
+  const resDoc = await resCol.findOne({ reservationId: reservation.reservationId });
+  assert.equal(resDoc.status, "RESERVED");
+  assert.equal(resDoc.releasedAt, undefined);
+
+  // Fail closed: wallet balances unchanged.
+  const wallet = await reconcileAndGetWallet(db, "s22-9b");
+  assert.equal(wallet.reservedCredits, 5);
+  assert.equal(wallet.reservedMonthlyCredits, 5);
+
+  // Restore a transaction-capable topology: a later sweep expires it exactly once.
+  db.topology = { description: { type: "ReplicaSetWithPrimary" } };
+  const retry = await expireStaleReservations(db, { userId: "s22-9b" });
+  assert.equal(retry.expiredCount, 1);
+  const resDoc2 = await resCol.findOne({ reservationId: reservation.reservationId });
+  assert.equal(resDoc2.status, "EXPIRED");
+  const wallet2 = await reconcileAndGetWallet(db, "s22-9b");
+  assert.equal(wallet2.reservedCredits, 0);
+  assert.equal(wallet2.reservedMonthlyCredits, 0);
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 10: Recovery of an old-cycle reservation does not charge current daily allowance
+// -------------------------------------------------------------
+test("2.2-10: Recovery of an old-cycle reservation never charges the current day's allowance", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-10", { plan: "BUILDER", status: "ACTIVE", expiryDate: new Date(Date.now() + 86400000 * 30) });
+
+  const reservation = await reserveCredits(db, { userId: "s22-10", conversationId: "conv-22-10", estimatedCredits: 10 });
+  assert.equal(reservation.success, true);
+
+  await forceDailyReset(db, "s22-10", { plan: "BUILDER", status: "ACTIVE", expiryDate: new Date(Date.now() + 86400000 * 30) });
+
+  // Mark SETTLING with saved usage metadata.
+  const resCol = db.collection("nova_credit_reservations");
+  await resCol.updateOne(
+    { reservationId: reservation.reservationId },
+    {
+      $set: {
+        status: "SETTLING",
+        provider: "gemini",
+        model: "gemini-2.5-flash",
+        tokens: { inputTokens: 2000, outputTokens: 500 },
+      },
+    }
+  );
+
+  const recovered = await recoverSettlement(db, reservation.reservationId, "s22-10");
+  assert.equal(recovered.success, true);
+  assert.equal(recovered.creditsCharged, 3);
+
+  const wallet = await reconcileAndGetWallet(db, "s22-10");
+  assert.equal(wallet.dailyRemaining, 950); // current day untouched
+  assert.equal(wallet.dailyUsed, 0);
+  assert.equal(wallet.monthlyUsed, 3);
+  assert.equal(wallet.reservedCredits, 0);
+  assert.equal(wallet.reservedMonthlyCredits, 0);
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 11: Actual usage exceeding the estimate is recorded honestly
+// -------------------------------------------------------------
+test("2.2-11: Actual provider usage is recorded honestly, never clamped to the estimate", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-11", { plan: "FREE" });
+
+  const reservation = await reserveCredits(db, { userId: "s22-11", conversationId: "conv-22-11", estimatedCredits: 5 });
+  assert.equal(reservation.success, true);
+
+  // Settle with usage far exceeding the 5-credit estimate (~40 credits).
+  const settle = await settleReservation(db, {
+    reservationId: reservation.reservationId,
+    userId: "s22-11",
+    conversationId: "conv-22-11",
+    provider: "gemini",
+    model: "gemini-2.5-flash",
+    tokens: { inputTokens: 40000, outputTokens: 8000 },
+  });
+  assert.equal(settle.success, true);
+  assert.ok(settle.creditsCharged > 5);
+
+  const wallet = await reconcileAndGetWallet(db, "s22-11");
+  assert.equal(wallet.monthlyUsed, settle.creditsCharged); // full actual usage recorded
+  assert.equal(wallet.reservedCredits, 0);
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 12: New reservations are blocked when monthly capacity is exhausted
+// -------------------------------------------------------------
+test("2.2-12: Reservations are blocked when monthly capacity (including outstanding holds) is exhausted", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-12", { plan: "FREE" });
+
+  const walletCol = db.collection("nova_user_wallets");
+  await walletCol.updateOne(
+    { userId: "s22-12" },
+    { $set: { monthlyUsed: 749, reservedMonthlyCredits: 5 } } // 750 - 749 - 5 < 0
+  );
+
+  const reservation = await reserveCredits(db, { userId: "s22-12", conversationId: "conv-22-12", estimatedCredits: 2 });
+  assert.equal(reservation.success, false);
+  assert.equal(reservation.reason, "INSUFFICIENT_CREDITS");
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 13: Tier upgrade does not grant two allowances within one cycle
+// -------------------------------------------------------------
+test("2.2-13: Tier upgrade preserves the cycle anchor and does not re-grant a full daily allowance", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-13", { plan: "BUILDER", status: "ACTIVE", expiryDate: new Date(Date.now() + 86400000 * 30) });
+
+  // Consume 300 of the 950 daily allowance.
+  const walletCol = db.collection("nova_user_wallets");
+  await walletCol.updateOne(
+    { userId: "s22-13" },
+    { $set: { dailyUsed: 300, dailyRemaining: 650 } }
+  );
+
+  const before = await reconcileAndGetWallet(db, "s22-13");
+  const anchorBefore = new Date(before.lastDailyAllocationAt).getTime();
+
+  // Upgrade to PRO mid-cycle.
+  const upgraded = await reconcileAndGetWallet(db, "s22-13", {
+    plan: "PRO",
+    status: "ACTIVE",
+    expiryDate: new Date(Date.now() + 86400000 * 30),
+  });
+
+  // Consumed 300 must NOT be re-granted: remaining = 1900 - 300 = 1600, not 1900.
+  assert.equal(upgraded.dailyAllowance, 1900);
+  assert.equal(upgraded.dailyRemaining, 1600);
+  assert.equal(upgraded.dailyUsed, 300);
+  // Cycle anchor preserved -> no second allocation.
+  assert.equal(new Date(upgraded.lastDailyAllocationAt).getTime(), anchorBefore);
+});
+
+// -------------------------------------------------------------
+// 2.2 Test 14: Tier downgrade preserves consumed usage and correct limits
+// -------------------------------------------------------------
+test("2.2-14: Tier downgrade preserves consumed usage and enforces the lower daily limit", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s22-14", { plan: "PRO", status: "ACTIVE", expiryDate: new Date(Date.now() + 86400000 * 30) });
+
+  const walletCol = db.collection("nova_user_wallets");
+  await walletCol.updateOne(
+    { userId: "s22-14" },
+    { $set: { dailyUsed: 500, dailyRemaining: 1400, monthlyUsed: 600 } }
+  );
+
+  const before = await reconcileAndGetWallet(db, "s22-14");
+  const anchorBefore = new Date(before.lastDailyAllocationAt).getTime();
+
+  // Downgrade to FREE (25/day). Used 500 > 25 -> remaining must be 0.
+  const downgraded = await reconcileAndGetWallet(db, "s22-14", { plan: "FREE" });
+  assert.equal(downgraded.tier, "FREE");
+  assert.equal(downgraded.dailyAllowance, 25);
+  assert.equal(downgraded.dailyRemaining, 0);
+  assert.equal(downgraded.dailyUsed, 500); // consumed usage preserved
+  assert.equal(downgraded.monthlyCeiling, 750);
+  assert.equal(downgraded.monthlyUsed, 600); // monthly usage preserved
+  assert.equal(new Date(downgraded.lastDailyAllocationAt).getTime(), anchorBefore);
+});
+
+// =============================================================
+// Phase 2.2 Audit: Backward compatibility, expiration crash safety
+// =============================================================
+
+// Helper: simulate a pre-Phase-2.2 wallet by stripping the accounting fields.
+function stripLegacyWalletFields(db, userId) {
+  const walletCol = db.collection("nova_user_wallets");
+  const doc = walletCol.documents.find((d) => d.userId === userId);
+  assert.ok(doc, "wallet must exist before stripping fields");
+  delete doc.reservedMonthlyCredits;
+  delete doc.unbilledOverage;
+}
+
+// Helper: insert a legacy reservation (no allocationCycleAt) directly.
+function insertLegacyReservation(db, userId, conversationId, estimatedCredits, createdAt) {
+  return db.collection("nova_credit_reservations").insertOne({
+    reservationId: `legacy_res_${conversationId}`,
+    userId,
+    conversationId,
+    problemId: "problem-legacy",
+    estimatedCredits,
+    status: "RESERVED",
+    createdAt,
+    expiresAt: new Date(createdAt.getTime() + 10 * 60 * 1000),
+    // NOTE: intentionally NO allocationCycleAt field
+  });
+}
+
+// -------------------------------------------------------------
+// Audit Test A: Legacy wallet backfill includes outstanding monthly reservations
+// -------------------------------------------------------------
+test("Audit A: Pre-2.2 wallet with outstanding reservation is backfilled and monthly capacity accounts for the hold", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s-bc-1", { plan: "FREE" }); // 25/day, 750/month
+
+  // Simulate a pre-2.2 wallet (missing new accounting fields) with a legacy hold.
+  stripLegacyWalletFields(db, "s-bc-1");
+  await insertLegacyReservation(
+    db,
+    "s-bc-1",
+    "conv-bc-1",
+    3000, // exceeds the 750 monthly ceiling
+    new Date() // fresh (non-stale) so it is not swept before the capacity check
+  );
+
+  // reconcile must backfill reservedMonthlyCredits from the outstanding reservation.
+  const wallet = await reconcileAndGetWallet(db, "s-bc-1", { plan: "FREE" });
+  assert.equal(wallet.reservedMonthlyCredits, 3000);
+  assert.equal(wallet.unbilledOverage, 0);
+
+  // New reservations must be blocked because the backfilled monthly hold saturates capacity.
+  const reservation = await reserveCredits(db, {
+    userId: "s-bc-1",
+    conversationId: "conv-bc-1-new",
+    estimatedCredits: 2,
+  });
+  assert.equal(reservation.success, false);
+  assert.equal(reservation.reason, "INSUFFICIENT_CREDITS");
+});
+
+// -------------------------------------------------------------
+// Audit Test B: Legacy reservation settles after reset -> monthly only, no negative balance
+// -------------------------------------------------------------
+test("Audit B: Legacy reservation (no allocationCycleAt) settling after reset does not charge the new day and never goes negative", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s-bc-2", { plan: "FREE" });
+
+  stripLegacyWalletFields(db, "s-bc-2");
+  await insertLegacyReservation(
+    db,
+    "s-bc-2",
+    "conv-bc-2",
+    5,
+    new Date(Date.now() - 26 * 3600 * 1000) // created >24h ago -> old cycle
+  );
+
+  // Backfill, then advance to a fresh daily cycle.
+  await reconcileAndGetWallet(db, "s-bc-2", { plan: "FREE" });
+  await forceDailyReset(db, "s-bc-2", { plan: "FREE" });
+
+  const settle = await settleReservation(db, {
+    reservationId: "legacy_res_conv-bc-2",
+    userId: "s-bc-2",
+    conversationId: "conv-bc-2",
+    provider: "gemini",
+    model: "gemini-2.5-flash",
+    tokens: { inputTokens: 2000, outputTokens: 500 },
+  });
+  assert.equal(settle.success, true);
+  assert.equal(settle.creditsCharged, 3);
+
+  const wallet = await reconcileAndGetWallet(db, "s-bc-2", { plan: "FREE" });
+  assert.equal(wallet.dailyRemaining, 25); // new day untouched
+  assert.equal(wallet.dailyUsed, 0);
+  assert.equal(wallet.monthlyUsed, 3); // usage counted monthly
+  assert.equal(wallet.reservedCredits, 0);
+  assert.equal(wallet.reservedMonthlyCredits, 0); // never negative
+  assert.ok(wallet.reservedMonthlyCredits >= 0);
+});
+
+// -------------------------------------------------------------
+// Audit Test C: Legacy reservation within current window is treated as same-cycle
+// -------------------------------------------------------------
+test("Audit C: Legacy reservation created inside the current cycle is treated as same-cycle (daily charged)", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s-bc-3", { plan: "FREE" });
+
+  stripLegacyWalletFields(db, "s-bc-3");
+  await insertLegacyReservation(
+    db,
+    "s-bc-3",
+    "conv-bc-3",
+    5,
+    new Date() // created now -> within current window
+  );
+
+  await reconcileAndGetWallet(db, "s-bc-3", { plan: "FREE" });
+
+  const settle = await settleReservation(db, {
+    reservationId: "legacy_res_conv-bc-3",
+    userId: "s-bc-3",
+    conversationId: "conv-bc-3",
+    provider: "gemini",
+    model: "gemini-2.5-flash",
+    tokens: { inputTokens: 2000, outputTokens: 500 },
+  });
+  assert.equal(settle.success, true);
+
+  const wallet = await reconcileAndGetWallet(db, "s-bc-3", { plan: "FREE" });
+  assert.equal(wallet.dailyUsed, 3); // same-cycle daily usage charged
+  assert.equal(wallet.dailyRemaining, 22);
+  assert.equal(wallet.monthlyUsed, 3);
+  assert.equal(wallet.reservedMonthlyCredits, 0);
+});
+
+// -------------------------------------------------------------
+// Audit Test D: Expiration crash safety — rollback leaves reservation recoverable
+// -------------------------------------------------------------
+test("Audit D: Crash between EXPIRED transition and wallet release rolls back; a later sweep releases exactly once", async () => {
+  const db = new DynamicFakeDb();
+  await reconcileAndGetWallet(db, "s-bc-4", { plan: "FREE" });
+
+  const reservation = await reserveCredits(db, {
+    userId: "s-bc-4",
+    conversationId: "conv-bc-4",
+    estimatedCredits: 5,
+  });
+  assert.equal(reservation.success, true);
+
+  const resCol = db.collection("nova_credit_reservations");
+  await resCol.updateOne(
+    { reservationId: reservation.reservationId },
+    { $set: { expiresAt: new Date(Date.now() - 1000) } }
+  );
+
+  // Simulate a crash: the wallet release write fails mid-transaction.
+  const walletCol = db.collection("nova_user_wallets");
+  const origUpdateOne = walletCol.updateOne.bind(walletCol);
+  walletCol.updateOne = async () => {
+    throw new Error("simulated crash during wallet release");
+  };
+
+  let first;
+  try {
+    first = await expireStaleReservations(db, { userId: "s-bc-4" });
+  } finally {
+    walletCol.updateOne = origUpdateOne;
+  }
+
+  // The failed call must NOT have committed the EXPIRED transition or released the hold.
+  assert.equal(first.expiredCount, 0);
+  assert.equal(first.errors.length, 1);
+
+  const resAfterFail = await resCol.findOne({ reservationId: reservation.reservationId });
+  assert.equal(resAfterFail.status, "RESERVED"); // rolled back, still recoverable
+
+  let wallet = await reconcileAndGetWallet(db, "s-bc-4");
+  assert.equal(wallet.reservedCredits, 5); // hold still locked (not leaked)
+  assert.equal(wallet.reservedMonthlyCredits, 5);
+
+  // Retry after recovery: should now succeed and release exactly once.
+  const second = await expireStaleReservations(db, { userId: "s-bc-4" });
+  assert.equal(second.expiredCount, 1);
+
+  wallet = await reconcileAndGetWallet(db, "s-bc-4");
+  assert.equal(wallet.reservedCredits, 0);
+  assert.equal(wallet.reservedMonthlyCredits, 0);
+
+  const resFinal = await resCol.findOne({ reservationId: reservation.reservationId });
+  assert.equal(resFinal.status, "EXPIRED");
+  assert.equal(resFinal.releasedAt !== undefined, true);
+});
+
+// -------------------------------------------------------------
+// Audit Test E: isCurrentCycle inference unit check
+// -------------------------------------------------------------
+test("Audit E: isCurrentCycle distinguishes legacy reservations by their createdAt window", () => {
+  const now = Date.now();
+  const wallet = {
+    userId: "u",
+    lastDailyAllocationAt: new Date(now - 1000),
+    nextDailyResetAt: new Date(now + 24 * 3600 * 1000),
+  };
+
+  // Legacy reservation inside the window -> same cycle.
+  const inside = isCurrentCycle(wallet, {
+    reservationId: "r1",
+    userId: "u",
+    conversationId: "c",
+    estimatedCredits: 1,
+    status: "RESERVED",
+    createdAt: new Date(now),
+    expiresAt: new Date(now + 60000),
+  });
+  assert.equal(inside, true);
+
+  // Legacy reservation before the window -> old cycle.
+  const outside = isCurrentCycle(wallet, {
+    reservationId: "r2",
+    userId: "u",
+    conversationId: "c",
+    estimatedCredits: 1,
+    status: "RESERVED",
+    createdAt: new Date(now - 48 * 3600 * 1000),
+    expiresAt: new Date(now + 60000),
+  });
+  assert.equal(outside, false);
+
+  // Explicit allocationCycleAt takes precedence.
+  const explicitSame = isCurrentCycle(wallet, {
+    reservationId: "r3",
+    userId: "u",
+    conversationId: "c",
+    estimatedCredits: 1,
+    status: "RESERVED",
+    allocationCycleAt: wallet.lastDailyAllocationAt,
+    createdAt: new Date(now),
+    expiresAt: new Date(now + 60000),
+  });
+  assert.equal(explicitSame, true);
+
+  const explicitOld = isCurrentCycle(wallet, {
+    reservationId: "r4",
+    userId: "u",
+    conversationId: "c",
+    estimatedCredits: 1,
+    status: "RESERVED",
+    allocationCycleAt: new Date(now - 25 * 3600 * 1000),
+    createdAt: new Date(now),
+    expiresAt: new Date(now + 60000),
+  });
+  assert.equal(explicitOld, false);
 });
 

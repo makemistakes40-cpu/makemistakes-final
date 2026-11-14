@@ -16,6 +16,8 @@ export interface NovaWalletDocument {
   currentPeriodStart: Date;
   currentPeriodEnd: Date;
   reservedCredits: number;
+  reservedMonthlyCredits: number;
+  unbilledOverage: number;
   subscriptionOrderId?: string;
   isPaidActive: boolean;
   createdAt: Date;
@@ -105,6 +107,8 @@ export async function reconcileAndGetWallet(
       currentPeriodStart: now,
       currentPeriodEnd: periodEnd,
       reservedCredits: 0,
+      reservedMonthlyCredits: 0,
+      unbilledOverage: 0,
       subscriptionOrderId: userSubscription?.orderId,
       isPaidActive: isPaid,
       createdAt: now,
@@ -127,20 +131,54 @@ export async function reconcileAndGetWallet(
     throw new Error(`Failed to initialize or load wallet for ${userId}`);
   }
 
+  // 1b. Backfill accounting fields for wallets created before Phase 2.2.
+  // Pre-2.2 wallets lack `reservedMonthlyCredits` and may lack `unbilledOverage`.
+  // Populate them from the wallet's outstanding reservations so that existing holds are
+  // included in monthly capacity and decrements never create negative balances.
+  if (typeof wallet.reservedMonthlyCredits !== "number") {
+    const outstandingReservations = db
+      .collection("nova_credit_reservations")
+      .find({ userId, status: { $in: ["RESERVED", "SETTLING"] } });
+    const outstandingList = await outstandingReservations.toArray();
+    const outstandingHoldSum = outstandingList.reduce(
+      (sum, r) => sum + (r.estimatedCredits || 0),
+      0
+    );
+
+    const backfilled = await collection.findOneAndUpdate(
+      { userId },
+      {
+        $set: {
+          reservedMonthlyCredits: outstandingHoldSum,
+          unbilledOverage: wallet.unbilledOverage || 0,
+        },
+      },
+      { returnDocument: "after" }
+    );
+    if (backfilled) {
+      wallet = backfilled;
+    }
+  }
+
   // 2. Check for tier upgrade / downgrade or subscription status change
+  // Tier changes must NOT reset the allocation-cycle anchor and must NOT grant a second
+  // daily allowance. We adjust the remaining daily capacity against already-consumed usage
+  // in the current cycle and preserve monthly usage and all cycle timestamps.
   const tierChanged = wallet.tier !== tier || wallet.isPaidActive !== isPaid;
   if (tierChanged) {
-    const remainingMonthly = Math.max(0, tierConfig.monthlyAllocation - wallet.monthlyUsed);
-    const newDaily = Math.min(tierConfig.dailyAllocation, remainingMonthly);
+    const monthlyRemaining = Math.max(0, tierConfig.monthlyAllocation - wallet.monthlyUsed);
+    const newDailyCapacity = tierConfig.dailyAllocation;
+    const usedThisCycle = wallet.dailyUsed || 0;
+    // Preserve consumed usage: new remaining = clamp(capacity - used, 0, monthlyRemaining).
+    const newDailyRemaining = Math.max(0, Math.min(newDailyCapacity - usedThisCycle, monthlyRemaining));
 
     const updated = await collection.findOneAndUpdate(
       { userId, tier: wallet.tier },
       {
         $set: {
           tier,
-          dailyAllowance: tierConfig.dailyAllocation,
-          dailyRemaining: newDaily,
-          dailyUsed: 0,
+          dailyAllowance: newDailyCapacity,
+          dailyRemaining: newDailyRemaining,
           monthlyCeiling: tierConfig.monthlyAllocation,
           isPaidActive: isPaid,
           subscriptionOrderId: userSubscription?.orderId,
@@ -181,11 +219,23 @@ export async function reconcileAndGetWallet(
   );
 
   if (cyclesElapsed > 0) {
-    // Unused credits from previous day expire (no rollover)
+    // Unused credits from previous day expire (no rollover). Old-cycle reservation holds are
+    // dropped so they no longer reduce the new cycle's available daily credits.
     const monthlyRemaining = Math.max(0, wallet.monthlyCeiling - wallet.monthlyUsed);
     const replenishedDaily = Math.min(tierConfig.dailyAllocation, monthlyRemaining);
 
-    // Concurrency-safe atomic conditional update matching lastDailyAllocationAt
+    // Reconcile outstanding unbilled overage against the fresh daily allowance exactly once.
+    // overageApplied = min(newDailyCapacity, existingUnbilledOverage)
+    // newUnbilledOverage = existingUnbilledOverage - overageApplied
+    // dailyRemaining = newDailyCapacity - overageApplied
+    const existingOverage = wallet.unbilledOverage || 0;
+    const overageApplied = Math.min(replenishedDaily, existingOverage);
+    const newOverage = existingOverage - overageApplied;
+    const effectiveDaily = replenishedDaily - overageApplied;
+
+    // Concurrency-safe atomic conditional update matching lastDailyAllocationAt. Because we
+    // match the previous anchor and derive newOverage from the pre-reset document, only one
+    // concurrent worker can apply the overage deduction (idempotent).
     const updated = await collection.findOneAndUpdate(
       {
         userId,
@@ -193,8 +243,10 @@ export async function reconcileAndGetWallet(
       },
       {
         $set: {
-          dailyRemaining: replenishedDaily,
+          dailyRemaining: effectiveDaily,
           dailyUsed: 0,
+          unbilledOverage: newOverage,
+          reservedCredits: 0, // reset current-cycle reservation pool
           lastDailyAllocationAt: newAllocationAt,
           nextDailyResetAt: nextResetAt,
           updatedAt: now,

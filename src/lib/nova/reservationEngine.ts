@@ -16,6 +16,7 @@ export interface NovaReservationDocument {
   conversationId: string;
   problemId?: string;
   estimatedCredits: number;
+  allocationCycleAt?: Date;
   status: "RESERVED" | "SETTLING" | "SETTLED" | "RELEASED" | "EXPIRED";
   actualCreditsCharged?: number;
   overageCredits?: number;
@@ -47,6 +48,76 @@ export interface NovaDeductionReceiptDocument {
 const RESERVATION_COLLECTION = "nova_credit_reservations";
 const WALLET_COLLECTION = "nova_user_wallets";
 const DEDUCTION_RECEIPTS_COLLECTION = "nova_wallet_deduction_receipts";
+
+/**
+ * Determines whether a reservation belongs to the wallet's current daily allocation cycle.
+ *
+ * Backward compatibility:
+ * - Reservations created after Phase 2.2 carry an explicit `allocationCycleAt` snapshot.
+ * - Legacy reservations (no `allocationCycleAt`) are inferred from their `createdAt`:
+ *   if the reservation was created inside the current cycle window it is treated as a
+ *   same-cycle reservation (so its daily usage is charged); otherwise it is treated as an
+ *   old-cycle reservation (so it never consumes the current day's allowance).
+ */
+export function isCurrentCycle(
+  wallet: NovaWalletDocument | null | undefined,
+  reservation: NovaReservationDocument
+): boolean {
+  if (!wallet) {
+    return false;
+  }
+  const walletAnchor = new Date(wallet.lastDailyAllocationAt).getTime();
+
+  if (reservation.allocationCycleAt) {
+    return new Date(reservation.allocationCycleAt).getTime() === walletAnchor;
+  }
+
+  if (reservation.createdAt) {
+    const created = new Date(reservation.createdAt).getTime();
+    const nextReset = wallet.nextDailyResetAt
+      ? new Date(wallet.nextDailyResetAt).getTime()
+      : Number.POSITIVE_INFINITY;
+    return created >= walletAnchor && created < nextReset;
+  }
+
+  return false;
+}
+
+/**
+ * Backfills the Phase 2.2 accounting fields (`reservedMonthlyCredits`, `unbilledOverage`)
+ * on wallets created before Phase 2.2. `reservedMonthlyCredits` is derived from the user's
+ * outstanding reservations so existing holds are included in monthly capacity and decrements
+ * never create negative balances. No-op for wallets that already carry the fields.
+ */
+async function ensureWalletAccountingFields(
+  db: Db,
+  wallet: NovaWalletDocument | null | undefined
+): Promise<NovaWalletDocument | null | undefined> {
+  if (!wallet || typeof wallet.reservedMonthlyCredits === "number") {
+    return wallet;
+  }
+
+  const reservations = db.collection<NovaReservationDocument>(RESERVATION_COLLECTION);
+  const outstanding = await reservations
+    .find({ userId: wallet.userId, status: { $in: ["RESERVED", "SETTLING"] } })
+    .toArray();
+  const holdSum = outstanding.reduce((sum, r) => sum + (r.estimatedCredits || 0), 0);
+
+  const updated = await db
+    .collection<NovaWalletDocument>(WALLET_COLLECTION)
+    .findOneAndUpdate(
+      { userId: wallet.userId },
+      {
+        $set: {
+          reservedMonthlyCredits: holdSum,
+          unbilledOverage: wallet.unbilledOverage || 0,
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+  return updated || wallet;
+}
 
 /**
  * Verifies whether the MongoDB client topology supports multi-document transactions.
@@ -98,10 +169,18 @@ export async function reserveCredits(
   const { userId, conversationId, problemId } = params;
   const estimatedCredits = Math.max(1, params.estimatedCredits ?? 5);
 
+  // Sweep stale reservations for this user before evaluating availability so expired holds
+  // cannot artificially reduce capacity (P1-3). Best-effort; never blocks reservation.
+  try {
+    await expireStaleReservations(db, { userId });
+  } catch {
+    // non-blocking
+  }
+
   const wallet = await reconcileAndGetWallet(db, userId, params.userSubscription);
-  const unbilledOverage = (wallet as any).unbilledOverage || 0;
+  const unbilledOverage = wallet.unbilledOverage || 0;
   const availableDaily = wallet.dailyRemaining - unbilledOverage - wallet.reservedCredits;
-  const availableMonthly = wallet.monthlyCeiling - wallet.monthlyUsed - wallet.reservedCredits;
+  const availableMonthly = wallet.monthlyCeiling - wallet.monthlyUsed - wallet.reservedMonthlyCredits;
 
   if (availableDaily < estimatedCredits || availableMonthly < estimatedCredits) {
     return {
@@ -115,20 +194,42 @@ export async function reserveCredits(
   const reservationId = `res_${randomUUID()}`;
   const now = new Date();
   const expiresAt = new Date(now.getTime() + 5 * 60 * 1000); // 5-minute timeout window
+  const allocationCycleAt = wallet.lastDailyAllocationAt;
 
-  // Atomically increment reservedCredits if sufficient
+  // Atomically increment daily + monthly reservation pools if sufficient capacity remains.
+  // Uses $ifNull so pre-existing wallets lacking the new fields do not null-gate the guard.
   const updateResult = await db.collection<NovaWalletDocument>(WALLET_COLLECTION).updateOne(
     {
       userId,
       $expr: {
         $and: [
-          { $gte: [{ $subtract: ["$dailyRemaining", { $add: ["$reservedCredits", unbilledOverage] }] }, estimatedCredits] },
-          { $gte: [{ $subtract: ["$monthlyCeiling", { $add: ["$monthlyUsed", "$reservedCredits"] }] }, estimatedCredits] },
+          {
+            $gte: [
+              {
+                $subtract: [
+                  "$dailyRemaining",
+                  { $add: [{ $ifNull: ["$reservedCredits", 0] }, { $ifNull: ["$unbilledOverage", 0] }] },
+                ],
+              },
+              estimatedCredits,
+            ],
+          },
+          {
+            $gte: [
+              {
+                $subtract: [
+                  "$monthlyCeiling",
+                  { $add: [{ $ifNull: ["$monthlyUsed", 0] }, { $ifNull: ["$reservedMonthlyCredits", 0] }] },
+                ],
+              },
+              estimatedCredits,
+            ],
+          },
         ],
       },
     },
     {
-      $inc: { reservedCredits: estimatedCredits },
+      $inc: { reservedCredits: estimatedCredits, reservedMonthlyCredits: estimatedCredits },
       $set: { updatedAt: now },
     }
   );
@@ -148,6 +249,7 @@ export async function reserveCredits(
     conversationId,
     problemId,
     estimatedCredits,
+    allocationCycleAt,
     status: "RESERVED",
     createdAt: now,
     expiresAt,
@@ -302,10 +404,23 @@ export async function settleReservation(
   }
 
   const estimatedCredits = targetReservation.estimatedCredits;
-  const currentWallet = await wallets.findOne({ userId });
+  let currentWallet = await ensureWalletAccountingFields(db, await wallets.findOne({ userId }));
   const currentDaily = currentWallet?.dailyRemaining ?? 0;
-  const deductedDaily = Math.min(currentDaily, actualCredits);
-  const overage = Math.max(0, actualCredits - deductedDaily);
+
+  // Cycle-aware accounting: a reservation settled after its original daily allocation cycle
+  // has changed must NOT consume the new cycle's daily allowance, must NOT increment the new
+  // cycle's dailyUsed, and must NOT decrement the current cycle's reserved balance. Its actual
+  // usage still counts toward the applicable monthly accounting period.
+  // Uses isCurrentCycle so legacy reservations without an allocationCycleAt are inferred from
+  // their createdAt (safe under both same-cycle and old-cycle interpretations).
+  const sameCycle = isCurrentCycle(currentWallet, targetReservation);
+
+  let deductedDaily = 0;
+  let overage = 0;
+  if (sameCycle) {
+    deductedDaily = Math.min(currentDaily, actualCredits);
+    overage = Math.max(0, actualCredits - deductedDaily);
+  }
 
   // 4. Verify transaction capability on the actual MongoDB client topology
   const client = (db as any).client || (db as any).s?.client || (db as any);
@@ -357,16 +472,27 @@ export async function settleReservation(
         { session }
       );
 
-      await wallets.updateOne(
-        { userId },
-        {
-          $inc: {
+      // Same-cycle settlement debits daily + monthly pools and drops both holds.
+      // Old-cycle settlement only counts toward monthly usage and releases the monthly hold;
+      // it never touches the current cycle's daily or reserved balances.
+      const walletInc: Record<string, number> = sameCycle
+        ? {
             reservedCredits: -estimatedCredits,
+            reservedMonthlyCredits: -estimatedCredits,
             dailyRemaining: -deductedDaily,
             dailyUsed: deductedDaily,
             monthlyUsed: actualCredits,
             ...(overage > 0 ? { unbilledOverage: overage } : {}),
-          },
+          }
+        : {
+            reservedMonthlyCredits: -estimatedCredits,
+            monthlyUsed: actualCredits,
+          };
+
+      await wallets.updateOne(
+        { userId },
+        {
+          $inc: walletInc,
           $set: { updatedAt: now },
         },
         { session }
@@ -612,13 +738,141 @@ export async function releaseReservation(
   if (!reservation) return false;
 
   const now = new Date();
+  const wallet = await ensureWalletAccountingFields(db, await wallets.findOne({ userId }));
+  const sameCycle = isCurrentCycle(wallet, reservation);
+
+  // Release the hold. For a same-cycle reservation both the daily and monthly pools are
+  // decremented. For an old-cycle reservation the daily pool was already reset at cycle
+  // advance, so only the monthly reservation hold is released (never a negative decrement).
+  const walletInc: Record<string, number> =
+    { reservedMonthlyCredits: -reservation.estimatedCredits };
+  if (sameCycle) {
+    walletInc.reservedCredits = -reservation.estimatedCredits;
+  }
+
   await wallets.updateOne(
     { userId },
     {
-      $inc: { reservedCredits: -reservation.estimatedCredits },
+      $inc: walletInc,
       $set: { updatedAt: now },
     }
   );
 
   return true;
+}
+
+/**
+ * Expires stale RESERVED reservations (expiresAt < now) and releases their held credits.
+ *
+ * Safety properties:
+ * - Only transitions reservations that are still RESERVED via a conditional atomic update, so
+ *   concurrent expiry/settlement workers can never release the same reservation twice.
+ * - Never expires SETTLING reservations (those remain recoverable via their saved usage).
+ * - Never deletes financial records: EXPIRED reservations are preserved for audit/reconciliation.
+ * - Respects the reservation's original daily allocation cycle when releasing holds.
+ *
+ * Invocation: called lazily from reserveCredits (per-user) so no new background infrastructure is
+ * required. It can also be invoked by an external sweeper with a targetUserId for global cleanup.
+ */
+export async function expireStaleReservations(
+  db: Db,
+  opts?: { userId?: string; now?: Date }
+): Promise<{ expiredCount: number; errors: Array<{ reservationId: string; error: string }> }> {
+  const reservations = db.collection<NovaReservationDocument>(RESERVATION_COLLECTION);
+  const wallets = db.collection<NovaWalletDocument>(WALLET_COLLECTION);
+  const now = opts?.now || new Date();
+
+  const query: any = {
+    status: "RESERVED",
+    expiresAt: { $lt: now },
+  };
+  if (opts?.userId) query.userId = opts.userId;
+
+  const staleList = await reservations.find(query).toArray();
+
+  const client = (db as any).client || (db as any).s?.client || (db as any);
+  const isTransactionCapable = isClientTransactionCapable(client);
+
+  let expiredCount = 0;
+  const errors: Array<{ reservationId: string; error: string }> = [];
+
+  for (const reservation of staleList) {
+    // The status transition and the wallet hold release are performed inside a single MongoDB
+    // transaction so a crash can never leave a reservation EXPIRED while its reserved credits
+    // remain locked. If the transaction fails, it rolls back and the reservation stays
+    // RESERVED, so a later sweep will retry it (no permanent leak).
+    const transitionAndRelease = async (): Promise<boolean> => {
+      // Conditional atomic transition: only one worker can win this update. If another worker
+      // settled or released concurrently, the filter no longer matches and we skip it.
+      const transitioned = await reservations.findOneAndUpdate(
+        {
+          reservationId: reservation.reservationId,
+          userId: reservation.userId,
+          status: "RESERVED",
+        },
+        {
+          $set: {
+            status: "EXPIRED",
+            releasedAt: now,
+          },
+        },
+        { returnDocument: "before" }
+      );
+
+      if (!transitioned) return false; // concurrent worker already handled it
+
+      let wallet = await ensureWalletAccountingFields(
+        db,
+        await wallets.findOne({ userId: reservation.userId })
+      );
+      const sameCycle = isCurrentCycle(wallet, reservation);
+
+      const walletInc: Record<string, number> =
+        { reservedMonthlyCredits: -reservation.estimatedCredits };
+      if (sameCycle) {
+        walletInc.reservedCredits = -reservation.estimatedCredits;
+      }
+
+      await wallets.updateOne(
+        { userId: reservation.userId },
+        {
+          $inc: walletInc,
+          $set: { updatedAt: now },
+        }
+      );
+
+      return true;
+    };
+
+    try {
+      let released = false;
+      if (!isTransactionCapable) {
+        // Fail closed: expiration is a financial operation and must only run inside a
+        // transaction. When transactions are unavailable we DO NOT change the reservation
+        // status or any wallet balance; the reservation remains RESERVED so a later sweep
+        // (once transactions are available) will expire it. No sequential fallback.
+        errors.push({
+          reservationId: reservation.reservationId,
+          error: "TRANSACTION_UNAVAILABLE: Multi-document transactions are required for reservation expiration to guarantee financial integrity.",
+        });
+        continue;
+      }
+      const session = client.startSession();
+      try {
+        await session.withTransaction(async () => {
+          released = await transitionAndRelease();
+        });
+      } finally {
+        await session.endSession();
+      }
+      if (released) expiredCount++;
+    } catch (err: any) {
+      errors.push({
+        reservationId: reservation.reservationId,
+        error: err?.message || String(err),
+      });
+    }
+  }
+
+  return { expiredCount, errors };
 }
