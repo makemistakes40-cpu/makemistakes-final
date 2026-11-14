@@ -346,10 +346,10 @@ export async function createFile(
       deletedAt: null,
     };
     try {
-      await backend.files.insertOne(doc, { session });
+      await activeBackend.files.insertOne(doc, { session });
     } catch (err: any) {
       if (err?.code === 11000 || err?.codeName === "DuplicateKey") {
-        const existing = await backend.files.findOne(
+        const existing = await activeBackend.files.findOne(
           { userId, problemId, path: normalized },
           { session }
         );
@@ -359,7 +359,7 @@ export async function createFile(
       throw err;
     }
 
-    await applyQuotaDelta(backend.quotas, userId, problemId, 1, size, session);
+    await applyQuotaDelta(activeBackend.quotas, userId, problemId, 1, size, session);
     return { path: normalized, rev: 1, created: true };
   });
 }
@@ -527,7 +527,7 @@ export async function reviveFile(
     if (!tomb.deletedAt) throw new DuplicateFileError("File is already live");
     if (tomb.rev !== expectedRev) throw new RevisionConflictError();
 
-    const quota = await ensureQuota(backend.quotas, userId, problemId, session);
+    const quota = await ensureQuota(activeBackend.quotas, userId, problemId, session);
     if (quota.fileCount >= FILE_STORE_LIMITS.maxWorkspaceFiles) {
       throw new QuotaExceededError(
         "maxWorkspaceFiles",
@@ -541,7 +541,7 @@ export async function reviveFile(
       );
     }
 
-    await backend.files.updateOne(
+    await activeBackend.files.updateOne(
       { userId, problemId, path: normalized, deletedAt: { $ne: null } },
       {
         $set: {
@@ -555,7 +555,7 @@ export async function reviveFile(
       },
       { session }
     );
-    await applyQuotaDelta(backend.quotas, userId, problemId, 1, newSize, session);
+    await applyQuotaDelta(activeBackend.quotas, userId, problemId, 1, newSize, session);
 
     return { path: normalized, rev: tomb.rev + 1, created: true };
   });
