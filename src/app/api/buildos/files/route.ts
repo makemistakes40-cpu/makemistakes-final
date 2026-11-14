@@ -2,9 +2,11 @@ import { NextResponse } from "next/server";
 import { workspaceDir } from "@/lib/buildos/paths";
 import {
   createWorkspaceFile,
+  createWorkspaceFolder,
   deleteWorkspaceFile,
   listWorkspaceTree,
   readWorkspaceTextFile,
+  renameWorkspaceFile,
   writeWorkspaceTextFile,
 } from "@/lib/buildos/files";
 import { upsertWorkspaceMeta } from "@/lib/buildos/workspaceService";
@@ -150,7 +152,7 @@ export async function PUT(req: Request) {
   }
 }
 
-/** POST — create file */
+/** POST — create file or folder */
 export async function POST(req: Request) {
   try {
     const identity = await getAuthenticatedIdentity(req);
@@ -159,6 +161,7 @@ export async function POST(req: Request) {
     const body = await req.json();
     const problemId = String(body.problemId || "").trim();
     const filePath = String(body.path || "").trim();
+    const isFolder = Boolean(body.isFolder || filePath.endsWith("/"));
     const content = String(body.content ?? "");
     if (!problemId || !filePath) {
       return bad("problemId and path are required");
@@ -166,6 +169,20 @@ export async function POST(req: Request) {
 
     const { userId } = await requireOwnedWorkspace(identity, problemId);
     const root = workspaceDir(userId, problemId);
+
+    if (isFolder) {
+      createWorkspaceFolder(root, filePath);
+      await upsertWorkspaceMeta({ userId, problemId, status: "ready" });
+      await recordNovaActivity({
+        userId,
+        problemId,
+        type: "folder_created",
+        filePath,
+        summary: "Workspace folder was created.",
+      });
+      return NextResponse.json({ ok: true, path: filePath, tree: listWorkspaceTree(root) });
+    }
+
     createWorkspaceFile(root, filePath, content);
     await upsertWorkspaceMeta({ userId, problemId, status: "ready" });
     await recordNovaActivity({
@@ -177,6 +194,43 @@ export async function POST(req: Request) {
     });
 
     return NextResponse.json({ ok: true, path: filePath, tree: listWorkspaceTree(root) });
+  } catch (err: any) {
+    return NextResponse.json(
+      { error: err.message },
+      { status: err.status || 500 }
+    );
+  }
+}
+
+/** PATCH — rename file */
+export async function PATCH(req: Request) {
+  try {
+    const identity = await getAuthenticatedIdentity(req);
+    if (!identity) return bad("Authentication required", 401);
+
+    const body = await req.json();
+    const problemId = String(body.problemId || "").trim();
+    const oldPath = String(body.oldPath || "").trim();
+    const newPath = String(body.newPath || "").trim();
+
+    if (!problemId || !oldPath || !newPath) {
+      return bad("problemId, oldPath, and newPath are required");
+    }
+
+    const { userId } = await requireOwnedWorkspace(identity, problemId);
+    const root = workspaceDir(userId, problemId);
+
+    renameWorkspaceFile(root, oldPath, newPath);
+    await upsertWorkspaceMeta({ userId, problemId, status: "ready" });
+    await recordNovaActivity({
+      userId,
+      problemId,
+      type: "file_renamed",
+      filePath: newPath,
+      summary: `Workspace file was renamed from ${oldPath} to ${newPath}.`,
+    });
+
+    return NextResponse.json({ ok: true, oldPath, newPath, tree: listWorkspaceTree(root) });
   } catch (err: any) {
     return NextResponse.json(
       { error: err.message },

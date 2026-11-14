@@ -1,4 +1,4 @@
-export type PlanTier = "FREE" | "PRO" | "MAX";
+export type PlanTier = "FREE" | "BUILDER" | "PRO" | "MAX";
 
 export interface PlanConfig {
   id: PlanTier;
@@ -9,6 +9,7 @@ export interface PlanConfig {
   amountInPaise: number; // 1 INR = 100 paise
   currency: "INR";
   billingPeriod: "monthly" | "lifetime";
+  dailyAllocation: number;
   aiCreditsPerMonth: number;
   highlighted?: boolean;
   features: string[];
@@ -24,55 +25,77 @@ export const PLANS: Record<PlanTier, PlanConfig> = {
     amountInPaise: 0,
     currency: "INR",
     billingPeriod: "lifetime",
-    aiCreditsPerMonth: 100,
+    dailyAllocation: 25,
+    aiCreditsPerMonth: 750,
     features: [
       "Full access to all 8 Product Journey phases",
-      "100 AI credits per month for Socratic hints",
+      "25 Nova daily AI credits (750 / month)",
       "Standard test concurrency runner",
       "Public Proof-of-Work portfolio generation",
       "GitHub repository export",
       "Community leaderboard ranking",
     ],
   },
-  PRO: {
-    id: "PRO",
-    name: "Pro Builder Tier",
+  BUILDER: {
+    id: "BUILDER",
+    name: "Builder Tier",
     badge: "Most Popular",
     description: "For serious student engineers aiming for top-tier startup roles.",
-    price: 999,
-    amountInPaise: 99900,
+    price: 1799,
+    amountInPaise: 179900,
     currency: "INR",
     billingPeriod: "monthly",
-    aiCreditsPerMonth: 1000,
+    dailyAllocation: 950,
+    aiCreditsPerMonth: 28500,
     highlighted: true,
     features: [
       "Everything in Free Community Tier",
-      "1,000 AI credits per month with priority queue",
+      "950 Nova daily AI credits (28,500 / month)",
+      "Rolling 24-hour daily allocation reset",
       "In-depth Socratic Nova AI architectural code reviews",
+      "Balanced AI models with code generation and debugging",
       "Verified recruiter showcase & telemetry benchmark",
       "Custom portfolio domain linking",
-      "High-throughput concurrency test runner (10k req/s)",
       "Priority customer & technical support",
     ],
   },
-  MAX: {
-    id: "MAX",
-    name: "Max Founder Tier",
+  PRO: {
+    id: "PRO",
+    name: "Pro Tier",
     badge: "Elite",
     description: "Full unconstrained power for founders and senior engineering candidates.",
-    price: 2499,
-    amountInPaise: 249900,
+    price: 3499,
+    amountInPaise: 349900,
     currency: "INR",
     billingPeriod: "monthly",
-    aiCreditsPerMonth: 5000,
+    dailyAllocation: 1900,
+    aiCreditsPerMonth: 57000,
     features: [
-      "Everything in Pro Builder Tier",
-      "5,000 AI credits per month for intensive building",
+      "Everything in Builder Tier",
+      "1,900 Nova daily AI credits (57,000 / month)",
+      "Rolling 24-hour daily allocation reset",
+      "Priority access to reasoning AI models",
+      "Complex reasoning & advanced product validation",
       "Direct recruiter introductions & hiring pipeline routing",
-      "Unlimited production architecture reviews",
       "Automated recruiter-certified Proof-of-Work badges",
-      "1-on-1 Socratic mentor escalation",
       "Early access to new production mission tracks",
+    ],
+  },
+  MAX: {
+    // Legacy alias to PRO
+    id: "MAX",
+    name: "Max Founder Tier (Legacy)",
+    badge: "Elite",
+    description: "Legacy tier mapped to Pro capabilities.",
+    price: 3499,
+    amountInPaise: 349900,
+    currency: "INR",
+    billingPeriod: "monthly",
+    dailyAllocation: 1900,
+    aiCreditsPerMonth: 57000,
+    features: [
+      "Full Pro tier entitlements",
+      "1,900 Nova daily AI credits (57,000 / month)",
     ],
   },
 };

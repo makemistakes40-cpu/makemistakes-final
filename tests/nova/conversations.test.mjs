@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   appendNovaConversationMessage,
+  claimNovaCreditRequest,
   findNovaConversation,
   getOrCreateNovaConversation,
   matchesNovaImplementationProposal,
+  releaseNovaCreditClaim,
   saveNovaImplementationPlan,
   updateNovaImplementationStep,
 } from "../../src/lib/nova/conversations.ts";
@@ -13,10 +15,32 @@ import { parseNovaImplementationPlan } from "../../src/lib/nova/implementationPl
 class FakeCollection {
   documents = [];
 
+  matches(document, query) {
+    return Object.entries(query).every(([key, value]) => {
+      const actual = document[key];
+      if (value && typeof value === "object") {
+        if ("$ne" in value) {
+          if (Array.isArray(actual)) {
+            return !actual.includes(value.$ne);
+          }
+          return actual !== value.$ne;
+        }
+        if ("$in" in value) {
+          if (Array.isArray(actual)) {
+            return actual.some((item) => value.$in.includes(item));
+          }
+          return value.$in.includes(actual);
+        }
+      }
+      if (Array.isArray(actual)) {
+        return actual.includes(value);
+      }
+      return actual === value;
+    });
+  }
+
   async findOne(query) {
-    return this.documents.find((document) =>
-      Object.entries(query).every(([key, value]) => document[key] === value)
-    ) || null;
+    return this.documents.find((document) => this.matches(document, query)) || null;
   }
 
   async insertOne(document) {
@@ -27,9 +51,7 @@ class FakeCollection {
   }
 
   find(query) {
-    let matches = this.documents.filter((document) =>
-      Object.entries(query).every(([key, value]) => document[key] === value)
-    );
+    let matches = this.documents.filter((document) => this.matches(document, query));
     const cursor = {
       sort(spec) {
         matches = [...matches].sort((a, b) => {
@@ -55,8 +77,12 @@ class FakeCollection {
   async findOneAndUpdate(query, update) {
     const document = await this.findOne(query);
     if (!document) return null;
-    document.messageCount = (document.messageCount || 0) + update.$inc.messageCount;
-    Object.assign(document, update.$set || {});
+    if (update.$inc) {
+      document.messageCount = (document.messageCount || 0) + (update.$inc.messageCount || 0);
+    }
+    if (update.$set) {
+      Object.assign(document, update.$set);
+    }
     return structuredClone(document);
   }
 
@@ -72,7 +98,34 @@ class FakeCollection {
       document.technicalMemory = concatenated.slice(expression.$slice[1]);
       return { matchedCount: 1 };
     }
-    Object.assign(document, update.$set || {});
+    if (update.$inc) {
+      for (const [key, inc] of Object.entries(update.$inc)) {
+        document[key] = (document[key] || 0) + inc;
+      }
+    }
+    if (update.$addToSet) {
+      for (const [key, val] of Object.entries(update.$addToSet)) {
+        if (!Array.isArray(document[key])) document[key] = [];
+        if (!document[key].includes(val)) {
+          document[key].push(val);
+        }
+      }
+    }
+    if (update.$pull) {
+      for (const [key, val] of Object.entries(update.$pull)) {
+        if (Array.isArray(document[key])) {
+          document[key] = document[key].filter((item) => {
+            if (val && typeof val === "object" && "$in" in val) {
+              return !val.$in.includes(item);
+            }
+            return item !== val;
+          });
+        }
+      }
+    }
+    if (update.$set) {
+      Object.assign(document, update.$set);
+    }
     return { matchedCount: 1 };
   }
 }
@@ -268,4 +321,29 @@ test("implementation approval binds exact proposal, enforces order, and restores
     ),
     false
   );
+});
+
+test("credit claim: claimNovaCreditRequest and releaseNovaCreditClaim manage claim lifecycle", async () => {
+  const db = new FakeDb();
+  await getOrCreateNovaConversation(db, "student-claims", "P-CLAIM-1");
+
+  // First claim succeeds
+  const claimedFirst = await claimNovaCreditRequest(db, "student-claims", "P-CLAIM-1", "claim-abc");
+  assert.equal(claimedFirst, true);
+
+  // Duplicate claim while held fails
+  const claimedSecond = await claimNovaCreditRequest(db, "student-claims", "P-CLAIM-1", "claim-abc");
+  assert.equal(claimedSecond, false);
+
+  // Different claim can still be acquired
+  const claimedDifferent = await claimNovaCreditRequest(db, "student-claims", "P-CLAIM-1", "claim-xyz");
+  assert.equal(claimedDifferent, true);
+
+  // Release first claim
+  const released = await releaseNovaCreditClaim(db, "student-claims", "P-CLAIM-1", "claim-abc");
+  assert.equal(released, true);
+
+  // First claim can now be claimed again
+  const reclaimed = await claimNovaCreditRequest(db, "student-claims", "P-CLAIM-1", "claim-abc");
+  assert.equal(reclaimed, true);
 });

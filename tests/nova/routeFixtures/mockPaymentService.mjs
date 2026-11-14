@@ -1,5 +1,29 @@
 export class PaymentService {
-  static async deductAiCredit() {
-    return { success: true, remainingCredits: 10 };
+  static attempts = 0;
+  static successfulDeductions = 0;
+  static mockResult = null;
+  static mockHandler = null;
+
+  static reset() {
+    this.attempts = 0;
+    this.successfulDeductions = 0;
+    this.mockResult = null;
+    this.mockHandler = null;
+  }
+
+  static async deductAiCredit(userId, amount = 1, reason = "nova_chat") {
+    this.attempts += 1;
+    if (this.mockHandler) {
+      const res = await this.mockHandler({ userId, amount, reason, attempt: this.attempts });
+      if (res?.success) {
+        this.successfulDeductions += 1;
+      }
+      return res;
+    }
+    const result = this.mockResult || { success: true, remainingCredits: 10 };
+    if (result.success) {
+      this.successfulDeductions += 1;
+    }
+    return result;
   }
 }

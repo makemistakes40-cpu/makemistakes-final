@@ -21,6 +21,8 @@ function stripModuleSyntax(source: string, isPage = false): string {
   if (isPage) {
     const matchDefault = cleaned.match(/export\s+default\s+function\s+([a-zA-Z0-9_$]+)/);
     const matchNamed = cleaned.match(/export\s+function\s+([a-zA-Z0-9_$]+)/);
+    const matchConst = cleaned.match(/export\s+(?:const|let|var)\s+([a-zA-Z0-9_$]+)\s*=/);
+    const matchDefaultIdentifier = cleaned.match(/export\s+default\s+([a-zA-Z0-9_$]+);?/);
 
     if (matchDefault && matchDefault[1]) {
       const funcName = matchDefault[1];
@@ -28,7 +30,16 @@ function stripModuleSyntax(source: string, isPage = false): string {
       cleaned += `\nwindow.__BUILDOS_PAGE_APP__ = ${funcName};\n`;
     } else if (matchNamed && matchNamed[1]) {
       const funcName = matchNamed[1];
+      cleaned = cleaned.replace(/export\s+function\s+/g, "function ");
       cleaned += `\nwindow.__BUILDOS_PAGE_APP__ = ${funcName};\n`;
+    } else if (matchConst && matchConst[1]) {
+      const compName = matchConst[1];
+      cleaned = cleaned.replace(/export\s+(?:const|let|var)\s+/g, "var ");
+      cleaned += `\nwindow.__BUILDOS_PAGE_APP__ = ${compName};\nwindow.${compName} = ${compName};\n`;
+    } else if (matchDefaultIdentifier && matchDefaultIdentifier[1]) {
+      const idName = matchDefaultIdentifier[1];
+      cleaned = cleaned.replace(/export\s+default\s+([a-zA-Z0-9_$]+);?/g, "");
+      cleaned += `\nwindow.__BUILDOS_PAGE_APP__ = (typeof ${idName} !== "undefined" ? ${idName} : window.${idName});\n`;
     } else {
       cleaned = cleaned.replace(/export\s+default\s+function\s+/g, "function ");
       cleaned = cleaned.replace(/export\s+default\s+/g, "window.__BUILDOS_PAGE_APP__ = ");
@@ -212,6 +223,11 @@ class PreviewErrorBoundary extends React.Component {
 
 try {
   const App = window.__BUILDOS_PAGE_APP__
+    || (typeof Page !== "undefined" ? Page : null)
+    || (typeof window.Page !== "undefined" ? window.Page : null)
+    || (typeof App !== "undefined" ? App : null)
+    || (typeof window.App !== "undefined" ? window.App : null)
+    || (typeof Main !== "undefined" ? Main : null)
     || (typeof HeroPage !== "undefined" ? HeroPage : null)
     || (typeof WithNavbar !== "undefined" ? WithNavbar : null)
     || (typeof AppShell !== "undefined" ? AppShell : null)

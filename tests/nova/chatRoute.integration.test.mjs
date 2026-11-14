@@ -21,6 +21,7 @@ const [
     saveNovaImplementationPlan,
     updateNovaImplementationStep,
   },
+  { PaymentService },
 ] = await Promise.all([
   import("../../src/app/api/nova/chat/route.ts"),
   import("../../src/app/api/nova/implementation/route.ts"),
@@ -28,6 +29,7 @@ const [
   import("../../src/lib/authSession.ts"),
   import("../../src/lib/buildos/paths.ts"),
   import("../../src/lib/nova/conversations.ts"),
+  import("@/lib/paymentService"),
 ]);
 
 class FixtureCollection {
@@ -37,9 +39,26 @@ class FixtureCollection {
 
   matches(document, query) {
     return Object.entries(query).every(([key, value]) => {
+      if (key === "$expr") {
+        return true;
+      }
       const actual = document[key];
-      if (value && typeof value === "object" && "$in" in value) {
-        return value.$in.includes(actual);
+      if (value && typeof value === "object") {
+        if ("$ne" in value) {
+          if (Array.isArray(actual)) {
+            return !actual.includes(value.$ne);
+          }
+          return actual !== value.$ne;
+        }
+        if ("$in" in value) {
+          if (Array.isArray(actual)) {
+            return actual.some((item) => value.$in.includes(item));
+          }
+          return value.$in.includes(actual);
+        }
+      }
+      if (Array.isArray(actual)) {
+        return actual.includes(value);
       }
       return actual === value;
     });
@@ -50,8 +69,14 @@ class FixtureCollection {
   }
 
   async insertOne(document) {
-    this.documents.push(structuredClone(document));
-    return { insertedId: document._id };
+    const doc = structuredClone(document);
+    if (!doc._id) {
+      doc._id = crypto.randomUUID();
+    } else if (this.documents.some((item) => item._id === doc._id)) {
+      throw Object.assign(new Error("duplicate key"), { code: 11000 });
+    }
+    this.documents.push(doc);
+    return { insertedId: doc._id };
   }
 
   find(query) {
@@ -81,8 +106,34 @@ class FixtureCollection {
   async findOneAndUpdate(query, update) {
     const document = this.documents.find((item) => this.matches(item, query));
     if (!document) return null;
-    document.messageCount = (document.messageCount || 0) + (update.$inc?.messageCount || 0);
-    Object.assign(document, update.$set || {});
+    if (update.$inc) {
+      for (const [key, inc] of Object.entries(update.$inc)) {
+        document[key] = (document[key] || 0) + inc;
+      }
+    }
+    if (update.$addToSet) {
+      for (const [key, val] of Object.entries(update.$addToSet)) {
+        if (!Array.isArray(document[key])) document[key] = [];
+        if (!document[key].includes(val)) {
+          document[key].push(val);
+        }
+      }
+    }
+    if (update.$pull) {
+      for (const [key, val] of Object.entries(update.$pull)) {
+        if (Array.isArray(document[key])) {
+          document[key] = document[key].filter((item) => {
+            if (val && typeof val === "object" && "$in" in val) {
+              return !val.$in.includes(item);
+            }
+            return item !== val;
+          });
+        }
+      }
+    }
+    if (update.$set) {
+      Object.assign(document, update.$set);
+    }
     return structuredClone(document);
   }
 
@@ -94,7 +145,40 @@ class FixtureCollection {
       const notes = noteExpression.$slice[0].$concatArrays[1].$literal;
       document.technicalMemory = [...(document.technicalMemory || []), ...notes].slice(noteExpression.$slice[1]);
     } else {
-      Object.assign(document, update.$set || {});
+      if (update.$inc) {
+        for (const [key, inc] of Object.entries(update.$inc)) {
+          document[key] = (document[key] || 0) + inc;
+        }
+      }
+      if (update.$addToSet) {
+        for (const [key, val] of Object.entries(update.$addToSet)) {
+          if (!Array.isArray(document[key])) document[key] = [];
+          if (!document[key].includes(val)) {
+            document[key].push(val);
+          }
+        }
+      }
+      if (update.$pull) {
+        for (const [key, val] of Object.entries(update.$pull)) {
+          if (Array.isArray(document[key])) {
+            document[key] = document[key].filter((item) => {
+              if (val && typeof val === "object" && "$in" in val) {
+                return !val.$in.includes(item);
+              }
+              return item !== val;
+            });
+          }
+        }
+      }
+      if (update.$push) {
+        for (const [key, val] of Object.entries(update.$push)) {
+          if (!Array.isArray(document[key])) document[key] = [];
+          document[key].push(val);
+        }
+      }
+      if (update.$set) {
+        Object.assign(document, update.$set);
+      }
     }
     return { matchedCount: 1 };
   }
@@ -114,11 +198,25 @@ class FixtureCollection {
 class FixtureDb {
   constructor() {
     this.collections = new Map();
+    this.topology = { description: { type: "ReplicaSetWithPrimary" } };
+  }
+
+  get client() {
+    return this;
   }
 
   collection(name) {
     if (!this.collections.has(name)) this.collections.set(name, new FixtureCollection());
     return this.collections.get(name);
+  }
+
+  startSession() {
+    return {
+      async withTransaction(fn) {
+        return await fn();
+      },
+      async endSession() {},
+    };
   }
 }
 
@@ -205,6 +303,7 @@ const fixtureRoots = new Set();
 const fixtureOutsidePaths = new Set();
 
 test.after(() => {
+  PaymentService.reset();
   delete globalThis.__novaChatRouteTestDb;
   for (const root of fixtureRoots) {
     if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
@@ -471,4 +570,196 @@ test("workspace file route accepts only the exact executing proposal for a saved
   const applied = await writeBuildOSFile(authorized(code, binding));
   assert.equal(applied.status, 200);
   assert.equal(fs.readFileSync(path.join(fixture.root, "src", "auth.ts"), "utf8"), code);
+});
+
+test("credit claim: successful deduction releases claim upon completion and increments successful deductions", async (t) => {
+  PaymentService.reset();
+  const student = `${testUserPrefix}-credit-success@example.test`;
+  const project = `project-credit-success-${crypto.randomUUID()}`;
+  const fixture = makeProjectFixture(student, project, "credit-success");
+  fixtureRoots.add(fixture.root);
+  fixtureOutsidePaths.add(fixture.outsidePath);
+  useMockProvider(t);
+  const db = installFixtures([fixture]);
+
+  const req = authenticatedRequest(student, {
+    message: "Explain the project structure.",
+    requestId: "req-success-lifecycle",
+    context: { problemId: project },
+  });
+
+  const response = await POST(req);
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(PaymentService.attempts, 1);
+  assert.equal(PaymentService.successfulDeductions, 1);
+
+  // Messages appended: 1 user, 1 assistant
+  const messages = db.collection("nova_conversation_messages").documents;
+  assert.equal(messages.length, 2);
+
+  // Claim is cleanly released after completion
+  const conversationDoc = db.collection("nova_conversations").documents[0];
+  assert.equal((conversationDoc.activeClaims || []).includes("req-success-lifecycle"), false);
+});
+
+test("credit claim: confirmed deduction failure safely releases claim without stuck state and produces no free response", async () => {
+  PaymentService.reset();
+  PaymentService.mockResult = { success: false, reason: "INSUFFICIENT_CREDITS" };
+
+  const student = `${testUserPrefix}-credit-fail@example.test`;
+  const project = `project-credit-fail-${crypto.randomUUID()}`;
+  const fixture = makeProjectFixture(student, project, "credit-fail");
+  fixtureRoots.add(fixture.root);
+  fixtureOutsidePaths.add(fixture.outsidePath);
+  const db = installFixtures([fixture]);
+
+  const req = authenticatedRequest(student, {
+    message: "Help me debug this issue.",
+    requestId: "req-confirmed-failure",
+    context: { problemId: project },
+  });
+
+  const response = await POST(req);
+  const body = await response.json();
+
+  assert.equal(response.status, 402);
+  assert.equal(body.ok, false);
+  assert.equal(body.error, "INSUFFICIENT_CREDITS");
+  // Distinguish attempt from successful deduction
+  assert.equal(PaymentService.attempts, 1);
+  assert.equal(PaymentService.successfulDeductions, 0);
+
+  // Critical: No free AI responses due to failed billing
+  const messages = db.collection("nova_conversation_messages").documents;
+  assert.equal(messages.length, 0);
+
+  // Critical: No permanently stuck claim after confirmed failure
+  const conversationDoc = db.collection("nova_conversations").documents[0];
+  assert.equal((conversationDoc.activeClaims || []).includes("req-confirmed-failure"), false);
+});
+
+test("credit claim: insufficient-credit request can be retried successfully after top-up", async (t) => {
+  PaymentService.reset();
+  PaymentService.mockResult = { success: false, reason: "INSUFFICIENT_CREDITS" };
+
+  const student = `${testUserPrefix}-credit-topup@example.test`;
+  const project = `project-credit-topup-${crypto.randomUUID()}`;
+  const fixture = makeProjectFixture(student, project, "credit-topup");
+  fixtureRoots.add(fixture.root);
+  fixtureOutsidePaths.add(fixture.outsidePath);
+  useMockProvider(t);
+  const db = installFixtures([fixture]);
+
+  const createReq = () => authenticatedRequest(student, {
+    message: "Plan the next milestone.",
+    requestId: "req-topup-retry",
+    context: { problemId: project },
+  });
+
+  // Attempt 1: Insufficient credits
+  const response1 = await POST(createReq());
+  assert.equal(response1.status, 402);
+  assert.equal(PaymentService.attempts, 1);
+  assert.equal(PaymentService.successfulDeductions, 0);
+
+  // User tops up credits
+  PaymentService.mockResult = { success: true, remainingCredits: 10 };
+
+  // Attempt 2: Retry with exact same request ID
+  const response2 = await POST(createReq());
+  const body2 = await response2.json();
+  assert.equal(response2.status, 200);
+  assert.equal(body2.ok, true);
+  assert.equal(PaymentService.attempts, 2);
+  assert.equal(PaymentService.successfulDeductions, 1);
+
+  // Conversation now contains the messages and claim is released
+  const messages = db.collection("nova_conversation_messages").documents;
+  assert.equal(messages.length, 2);
+  const conversationDoc = db.collection("nova_conversations").documents[0];
+  assert.equal((conversationDoc.activeClaims || []).includes("req-topup-retry"), false);
+});
+
+test("credit claim: uncertain billing outcome never releases claim to prevent duplicate charges", async () => {
+  PaymentService.reset();
+  PaymentService.mockHandler = () => {
+    throw new Error("Simulated network timeout during credit deduction");
+  };
+
+  const student = `${testUserPrefix}-credit-uncertain@example.test`;
+  const project = `project-credit-uncertain-${crypto.randomUUID()}`;
+  const fixture = makeProjectFixture(student, project, "credit-uncertain");
+  fixtureRoots.add(fixture.root);
+  fixtureOutsidePaths.add(fixture.outsidePath);
+  const db = installFixtures([fixture]);
+
+  const createReq = () => authenticatedRequest(student, {
+    message: "Analyze the database schema.",
+    requestId: "req-uncertain-timeout",
+    context: { problemId: project },
+  });
+
+  // Attempt 1: Throws during deduction -> uncertain outcome
+  const response1 = await POST(createReq());
+  const body1 = await response1.json();
+  assert.equal(response1.status, 500);
+  assert.equal(body1.ok, false);
+  assert.equal(body1.error, "BILLING_UNCERTAIN");
+  assert.equal(PaymentService.attempts, 1);
+  assert.equal(PaymentService.successfulDeductions, 0);
+
+  // Claim MUST remain held to protect against duplicate deduction
+  const conversationDoc = db.collection("nova_conversations").documents[0];
+  assert.equal((conversationDoc.activeClaims || []).includes("req-uncertain-timeout"), true);
+
+  // Attempt 2: Immediate retry with same claimId must be rejected as concurrent / held claim
+  PaymentService.mockHandler = null;
+  PaymentService.mockResult = { success: true, remainingCredits: 5 };
+
+  const response2 = await POST(createReq());
+  const body2 = await response2.json();
+  assert.equal(response2.status, 409);
+  assert.equal(body2.error, "CONCURRENT_REQUEST");
+
+  // Crucial: Billing deduction was NOT attempted on the duplicate request
+  assert.equal(PaymentService.attempts, 1);
+  assert.equal(PaymentService.successfulDeductions, 0);
+});
+
+test("credit claim: concurrent duplicate requests race for claim and exactly one succeeds", async (t) => {
+  PaymentService.reset();
+  PaymentService.mockHandler = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    return { success: true, remainingCredits: 10 };
+  };
+
+  const student = `${testUserPrefix}-credit-race@example.test`;
+  const project = `project-credit-race-${crypto.randomUUID()}`;
+  const fixture = makeProjectFixture(student, project, "credit-race");
+  fixtureRoots.add(fixture.root);
+  fixtureOutsidePaths.add(fixture.outsidePath);
+  useMockProvider(t);
+  installFixtures([fixture]);
+
+  const req1 = authenticatedRequest(student, {
+    message: "Race condition test message.",
+    requestId: "req-race-id-1",
+    context: { problemId: project },
+  });
+  const req2 = authenticatedRequest(student, {
+    message: "Race condition test message.",
+    requestId: "req-race-id-1",
+    context: { problemId: project },
+  });
+
+  const [res1, res2] = await Promise.all([POST(req1), POST(req2)]);
+  const statuses = [res1.status, res2.status].sort();
+
+  // Exactly one request succeeded (200) and one was blocked (409)
+  assert.deepEqual(statuses, [200, 409]);
+  // Crucial: Exactly one deduction occurred, no duplicate charges
+  assert.equal(PaymentService.successfulDeductions, 1);
 });

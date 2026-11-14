@@ -27,6 +27,7 @@ type ConversationDocument = Document & {
   technicalMemory: string[];
   messageCount: number;
   implementationPlan?: NovaImplementationPlan;
+  activeClaims?: string[];
   createdAt: Date;
   updatedAt: Date;
 };
@@ -124,6 +125,7 @@ export async function getOrCreateNovaConversation(
       conversationId: randomUUID(),
       technicalMemory: [],
       messageCount: 0,
+      activeClaims: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -348,4 +350,43 @@ export async function appendNovaConversationMessage(
       },
     ]);
   }
+}
+
+export async function claimNovaCreditRequest(
+  db: Db,
+  userId: string,
+  problemId: string,
+  claimId: string
+): Promise<boolean> {
+  const key = projectKey(userId, problemId);
+  const result = await db.collection<ConversationDocument>(CONVERSATIONS).updateOne(
+    {
+      _id: key,
+      userId,
+      problemId,
+      activeClaims: { $ne: claimId },
+    },
+    {
+      $addToSet: { activeClaims: claimId },
+      $set: { updatedAt: new Date() },
+    }
+  );
+  return result.matchedCount > 0;
+}
+
+export async function releaseNovaCreditClaim(
+  db: Db,
+  userId: string,
+  problemId: string,
+  claimId: string
+): Promise<boolean> {
+  const key = projectKey(userId, problemId);
+  const result = await db.collection<ConversationDocument>(CONVERSATIONS).updateOne(
+    { _id: key, userId, problemId },
+    {
+      $pull: { activeClaims: claimId as any },
+      $set: { updatedAt: new Date() },
+    } as any
+  );
+  return result.matchedCount > 0;
 }

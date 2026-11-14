@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import { localNovaFallback } from "@/lib/sandpackFiles";
 import { buildNovaProjectContext } from "@/lib/nova/contextBuilder";
@@ -6,11 +7,18 @@ import { requireOwnedWorkspace } from "@/lib/security/workspaceOwnership";
 import { getDb } from "@/lib/mongodb";
 import {
   appendNovaConversationMessage,
+  claimNovaCreditRequest,
   getOrCreateNovaConversation,
+  releaseNovaCreditClaim,
   saveNovaImplementationPlan,
   sanitizeNovaMessage,
 } from "@/lib/nova/conversations";
 import { parseNovaImplementationPlan } from "@/lib/nova/implementationPlan";
+import { extractNormalizedUsage } from "@/lib/nova/metering";
+import { releaseReservation, reserveCredits, settleReservation } from "@/lib/nova/reservationEngine";
+import { reconcileAndGetWallet } from "@/lib/nova/allocationEngine";
+import { getEffectivePricingConfig } from "@/lib/nova/pricingConfig";
+import { routeModelForTier } from "@/lib/nova/modelRouter";
 
 export const runtime = "nodejs";
 
@@ -173,20 +181,20 @@ ${ctx.implementationPlan ? JSON.stringify(ctx.implementationPlan) : "No feature 
     rawDifficulty.includes("adv") || rawDifficulty.includes("expert")
       ? "Advanced"
       : rawDifficulty.includes("inter")
-      ? "Intermediate"
-      : "Beginner";
+        ? "Intermediate"
+        : "Beginner";
 
   // Build mode from context (guided/assisted/independent)
   const buildMode: "guided" | "assisted" | "independent" =
     ctx?.buildMode === "independent"
       ? "independent"
       : ctx?.buildMode === "assisted"
-      ? "assisted"
-      : difficulty === "Advanced"
-      ? "independent"
-      : difficulty === "Intermediate"
-      ? "assisted"
-      : "guided";
+        ? "assisted"
+        : difficulty === "Advanced"
+          ? "independent"
+          : difficulty === "Intermediate"
+            ? "assisted"
+            : "guided";
 
   const file = ctx?.activeFile || "app/page.tsx";
   const missionTitle = ctx?.missionTitle || "Current Mission";
@@ -400,10 +408,10 @@ Task Type: ${taskOwnership === "provided" ? "PROVIDED SCAFFOLD (student studies 
 TASK OWNERSHIP RULE
 ═══════════════════════════════════════════════════════════════════════════════
 ${taskOwnership === "provided"
-  ? `This is a PROVIDED SCAFFOLD step. The code is given to the student to study.
+      ? `This is a PROVIDED SCAFFOLD step. The code is given to the student to study.
 You can explain the code fully and help them understand every part of it.
 Encourage them to run it, read it carefully, and understand it before moving on.`
-  : `This is a STUDENT IMPLEMENTATION step. The student must write this code.
+      : `This is a STUDENT IMPLEMENTATION step. The student must write this code.
 Your job is to guide them — NOT to write it for them (in Guided/Assisted mode).
 If they haven't tried yet, ask them to attempt it first.
 Respond to "build this for me" with the correct mentor behavior for ${buildMode} mode.`}
@@ -540,136 +548,306 @@ export async function POST(req: Request) {
       execution: context.execution,
     });
 
-    const creditResult = await PaymentService.deductAiCredit(session.userId, 1, "nova_chat");
-    if (!creditResult.success && creditResult.reason === "INSUFFICIENT_CREDITS") {
+    const rawClaim = (
+      typeof body.requestId === "string" && body.requestId.trim()
+        ? body.requestId.trim()
+        : typeof body.claimId === "string" && body.claimId.trim()
+          ? body.claimId.trim()
+          : ""
+    );
+    const claimId = rawClaim || createHash("sha256").update(`${conversation.conversationId}:${lastUser}`).digest("hex");
+
+    const claimAcquired = await claimNovaCreditRequest(db, userId, problemId, claimId);
+    if (!claimAcquired) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "CONCURRENT_REQUEST",
+          message: "A request with this claim is already being processed.",
+        },
+        { status: 409 }
+      );
+    }
+
+    // 1. Resolve user subscription tier from trusted server-side wallet
+    const wallet = await reconcileAndGetWallet(db, userId);
+    const userTier = wallet.tier;
+    const estimatedCredits = userTier === "FREE" ? 2 : 5;
+
+    // 2. Pre-execution credit reservation: check allowance and lock credits before calling any AI provider
+    const reserveResult = await reserveCredits(db, {
+      userId,
+      conversationId: conversation.conversationId,
+      problemId,
+      estimatedCredits,
+    });
+
+    if (!reserveResult.success) {
+      await releaseNovaCreditClaim(db, userId, problemId, claimId).catch(() => { });
       return NextResponse.json(
         {
           ok: false,
           error: "INSUFFICIENT_CREDITS",
           message:
-            "You have reached your AI credit limit for this period. Upgrade to Pro Builder or Max Founder in Billing Settings for more credits.",
+            reserveResult.message ||
+            "You have reached your daily AI credit limit. Please wait for the daily reset or upgrade your plan.",
         },
         { status: 402 }
       );
     }
 
-    await appendNovaConversationMessage(db, userId, problemId, conversation.conversationId, "user", lastUser);
-    const conversationWithUserMessage = await getOrCreateNovaConversation(db, userId, problemId);
+    const reservationId = reserveResult.reservationId!;
+    let shouldReleaseClaim = false;
+    let reservationSettled = false;
+    let providerExecutionSucceeded = false;
 
-    const difficulty = projectContext.problem.difficulty || projectContext.problem.learning?.level || "Beginner";
-    const normalizedDifficulty = String(difficulty).toLowerCase();
-    const buildMode = normalizedDifficulty.includes("adv") || normalizedDifficulty.includes("expert")
-      ? "independent"
-      : normalizedDifficulty.includes("inter")
-        ? "assisted"
-        : "guided";
-    const systemPrompt = buildMentorSystemPrompt({
-      serverProjectContext: projectContext.prompt,
-      mentorMode: String(context.mentorMode || "UNDERSTAND"),
-      buildMode,
-      implementationPlan: conversationWithUserMessage.implementationPlan,
-    });
-    const providers = getProviderConfigs();
+    try {
+      let creditResult: { success: boolean; reason?: string; message?: string; remainingCredits?: number };
+      try {
+        creditResult = await PaymentService.deductAiCredit(session.userId, 1, "nova_chat");
+      } catch (deductErr) {
+        console.error("[Nova chat] Credit deduction uncertain failure.", {
+          errorName: deductErr instanceof Error ? deductErr.name : "UnknownError",
+        });
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "BILLING_UNCERTAIN",
+            message: "Billing verification could not be confirmed. Please retry later or contact support.",
+          },
+          { status: 500 }
+        );
+      }
 
-    const openaiMessages: ChatMessage[] = [
-      { role: "system", content: systemPrompt },
-      ...(conversationWithUserMessage.technicalMemory
-        ? [{
+      if (!creditResult?.success) {
+        await releaseReservation(db, reservationId, userId, "BILLING_FAILED").catch(() => { });
+        await releaseNovaCreditClaim(db, userId, problemId, claimId).catch((err) => {
+          console.warn("[Nova chat] Failed to release credit claim after confirmed failure.", err);
+        });
+        if (creditResult?.reason === "INSUFFICIENT_CREDITS") {
+          return NextResponse.json(
+            {
+              ok: false,
+              error: "INSUFFICIENT_CREDITS",
+              message:
+                "You have reached your AI credit limit for this period. Upgrade to Pro Builder or Max Founder in Billing Settings for more credits.",
+            },
+            { status: 402 }
+          );
+        }
+        return NextResponse.json(
+          {
+            ok: false,
+            error: creditResult?.reason || "PAYMENT_FAILED",
+            message: creditResult?.message || "Failed to deduct AI credits.",
+          },
+          { status: 402 }
+        );
+      }
+
+      shouldReleaseClaim = true;
+
+      await appendNovaConversationMessage(db, userId, problemId, conversation.conversationId, "user", lastUser);
+      const conversationWithUserMessage = await getOrCreateNovaConversation(db, userId, problemId);
+
+      const difficulty = projectContext.problem.difficulty || projectContext.problem.learning?.level || "Beginner";
+      const normalizedDifficulty = String(difficulty).toLowerCase();
+      const buildMode = normalizedDifficulty.includes("adv") || normalizedDifficulty.includes("expert")
+        ? "independent"
+        : normalizedDifficulty.includes("inter")
+          ? "assisted"
+          : "guided";
+      const systemPrompt = buildMentorSystemPrompt({
+        serverProjectContext: projectContext.prompt,
+        mentorMode: String(context.mentorMode || "UNDERSTAND"),
+        buildMode,
+        implementationPlan: conversationWithUserMessage.implementationPlan,
+      });
+
+      // 3. Enforce tier-based model routing: resolve allowed providers and token caps server-side
+      const pricingConfig = await getEffectivePricingConfig(db);
+      const routeResult = routeModelForTier({
+        tier: userTier,
+        mentorMode: String(context.mentorMode || "UNDERSTAND"),
+        config: pricingConfig,
+      });
+
+      const allowedProviderMap = new Map<LlmProviderConfig["provider"], (typeof routeResult.allowedProviders)[number]>();
+      for (const p of routeResult.allowedProviders) {
+        allowedProviderMap.set(p.provider, p);
+        if (p.provider === "groq") {
+          allowedProviderMap.set("groq_backup", p);
+        }
+      }
+
+      const availableProviders = getProviderConfigs();
+      const providers = availableProviders
+        .filter((p) => allowedProviderMap.has(p.provider))
+        .map((p) => {
+          const routed = allowedProviderMap.get(p.provider)!;
+          return {
+            ...p,
+            model: routed.model || p.model,
+            maxTokens: Math.min(routed.maxTokens || routeResult.maxOutputTokens, routeResult.maxOutputTokens),
+            temperature: routed.temperature,
+          };
+        });
+
+      const openaiMessages: ChatMessage[] = [
+        { role: "system", content: systemPrompt },
+        ...(conversationWithUserMessage.technicalMemory
+          ? [{
             role: "system" as const,
             content: `Persistent technical decisions and implementation context from earlier conversation:\n${conversationWithUserMessage.technicalMemory}`,
           }]
-        : []),
-      ...conversationWithUserMessage.messages.map(({ role, content }) => ({ role, content })),
-    ];
-    let responseText = "";
-    let responseMode: "llm" | "local" = "local";
-    let responseProvider: LlmProviderConfig["provider"] | undefined;
+          : []),
+        ...conversationWithUserMessage.messages.map(({ role, content }) => ({ role, content })),
+      ];
+      let responseText = "";
+      let responseMode: "llm" | "local" = "local";
+      let responseProvider: LlmProviderConfig["provider"] | undefined;
+      let lastProviderData: any = null;
+      let lastModelName = "";
 
-    // Try providers in cascade order (Groq 1 -> Groq 2 -> OpenRouter -> OpenAI)
-    for (const provider of providers) {
-      try {
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${provider.apiKey}`,
-        };
-        if (provider.provider === "openrouter") {
-          headers["HTTP-Referer"] = process.env.OPENROUTER_SITE_URL || "http://localhost:3000";
-          headers["X-Title"] = process.env.OPENROUTER_APP_NAME || "MakeMistakes BuildOS Nova";
-        }
-
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 6500);
-
-        const res = await fetch(`${provider.baseUrl}/chat/completions`, {
-          method: "POST",
-          headers,
-          signal: controller.signal,
-          body: JSON.stringify({
-            model: provider.model,
-            messages: openaiMessages,
-            temperature: 0.55,
-            max_tokens: 1800,
-            stream: false,
-          }),
-        }).finally(() => clearTimeout(timeoutId));
-
-        if (res.ok) {
-          const data = await res.json();
-          responseText = data?.choices?.[0]?.message?.content || "";
-          if (responseText) {
-            responseMode = "llm";
-            responseProvider = provider.provider;
-            break;
+      // Try allowed providers in order (enforcing tier limits)
+      for (const provider of providers) {
+        try {
+          const headers: Record<string, string> = {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${provider.apiKey}`,
+          };
+          if (provider.provider === "openrouter") {
+            headers["HTTP-Referer"] = process.env.OPENROUTER_SITE_URL || "http://localhost:3000";
+            headers["X-Title"] = process.env.OPENROUTER_APP_NAME || "MakeMistakes BuildOS Nova";
           }
-        }
 
-        console.warn(`[Nova AI] Provider ${provider.provider} returned status ${res.status}.`);
-      } catch (providerErr: unknown) {
-        console.warn(`[Nova AI] Provider ${provider.provider} fetch failed.`, {
-          errorName: providerErr instanceof Error ? providerErr.name : "UnknownError",
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 6500);
+
+          const res = await fetch(`${provider.baseUrl}/chat/completions`, {
+            method: "POST",
+            headers,
+            signal: controller.signal,
+            body: JSON.stringify({
+              model: provider.model,
+              messages: openaiMessages,
+              temperature: provider.temperature ?? 0.55,
+              max_tokens: Math.min(provider.maxTokens ?? 1800, routeResult.maxOutputTokens),
+              stream: false,
+            }),
+          }).finally(() => clearTimeout(timeoutId));
+
+          if (res.ok) {
+            const data = await res.json();
+            responseText = data?.choices?.[0]?.message?.content || "";
+            if (responseText) {
+              responseMode = "llm";
+              responseProvider = provider.provider;
+              lastModelName = provider.model;
+              lastProviderData = data;
+              providerExecutionSucceeded = true;
+              break;
+            }
+          }
+
+          console.warn(`[Nova AI] Provider ${provider.provider} returned status ${res.status}.`);
+        } catch (providerErr: unknown) {
+          console.warn(`[Nova AI] Provider ${provider.provider} fetch failed.`, {
+            errorName: providerErr instanceof Error ? providerErr.name : "UnknownError",
+          });
+        }
+      }
+
+      // Local Fallback if all providers fail or hit rate limits
+      if (!responseText) {
+        responseText = localNovaFallback({
+          question: lastUser,
+          productName: projectContext.workspace.productName,
+          statement: projectContext.problem.problemStatement || projectContext.problem.title,
+          missionTitle: projectContext.activeMission?.title || "",
+          activeFile: projectContext.sourceFiles[0]?.path || "",
+          fileCode: projectContext.sourceFiles[0]?.content || "",
+          responsibilityLevel: projectContext.workspace.responsibility,
+          buildObjective: projectContext.activeMission?.whatThisMeans || "",
+          mode: String(context.mentorMode || "UNDERSTAND"),
+          problemStatement: projectContext.problem.problemStatement || projectContext.problem.title,
+          difficulty: String(difficulty),
+          design: projectContext.journey?.design || null,
+          plan: projectContext.journey?.plan || null,
+        });
+        providerExecutionSucceeded = true;
+      }
+
+      let implementationPlan = conversationWithUserMessage.implementationPlan;
+      if (String(context.mentorMode || "").toUpperCase() === "PLAN") {
+        const parsedPlan = parseNovaImplementationPlan(responseText);
+        responseText = parsedPlan.message;
+        if (parsedPlan.plan) {
+          await saveNovaImplementationPlan(db, userId, problemId, conversation.conversationId, parsedPlan.plan);
+          implementationPlan = parsedPlan.plan;
+        }
+      }
+
+      responseText = sanitizeNovaMessage(responseText);
+      await appendNovaConversationMessage(db, userId, problemId, conversation.conversationId, "assistant", responseText);
+
+      // 4. Settle reservation atomically after response completion
+      const totalPromptChars = openaiMessages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+      const tokenCounts = extractNormalizedUsage(lastProviderData, totalPromptChars, responseText.length);
+
+      // Persist provider and token usage metadata on the reservation BEFORE settlement
+      // so recovery has complete information even if settlement fails
+      await db.collection("nova_credit_reservations").updateOne(
+        { reservationId },
+        {
+          $set: {
+            provider: responseProvider || "local",
+            model: lastModelName || "fallback",
+            tokens: tokenCounts,
+            lastProviderResponseAt: new Date(),
+          },
+        }
+      ).catch(() => {});
+
+      try {
+        await settleReservation(db, {
+          reservationId,
+          userId,
+          conversationId: conversation.conversationId,
+          problemId,
+          provider: responseProvider || "local",
+          model: lastModelName || "fallback",
+          tokens: tokenCounts,
+          executionStatus: responseMode === "llm" ? "SUCCESS" : "RETRY_FALLBACK",
+        });
+        reservationSettled = true;
+      } catch (settleErr) {
+        console.error("[Nova Chat Billing Alert] Provider execution succeeded but settlement failed; reservation preserved in recoverable state.", {
+          reservationId,
+          userId,
+          conversationId: conversation.conversationId,
+          error: settleErr instanceof Error ? settleErr.message : String(settleErr),
+        });
+      }
+      return NextResponse.json({
+        ok: true,
+        mode: responseMode,
+        provider: responseProvider,
+        conversationId: conversation.conversationId,
+        implementationPlan,
+        message: responseText,
+      });
+    } finally {
+      // ONLY release reservation if execution was genuinely non-billable / failed before provider completed
+      if (reservationId && !reservationSettled && !providerExecutionSucceeded) {
+        await releaseReservation(db, reservationId, userId, "REQUEST_UNSETTLED").catch(() => { });
+      }
+      if (shouldReleaseClaim) {
+        await releaseNovaCreditClaim(db, userId, problemId, claimId).catch((err) => {
+          console.warn("[Nova chat] Failed to release credit claim.", err);
         });
       }
     }
-
-    // Local Fallback if all providers fail or hit rate limits
-    if (!responseText) {
-      responseText = localNovaFallback({
-        question: lastUser,
-        productName: projectContext.workspace.productName,
-        statement: projectContext.problem.problemStatement || projectContext.problem.title,
-        missionTitle: projectContext.activeMission?.title || "",
-        activeFile: projectContext.sourceFiles[0]?.path || "",
-        fileCode: projectContext.sourceFiles[0]?.content || "",
-        responsibilityLevel: projectContext.workspace.responsibility,
-        buildObjective: projectContext.activeMission?.whatThisMeans || "",
-        mode: String(context.mentorMode || "UNDERSTAND"),
-        problemStatement: projectContext.problem.problemStatement || projectContext.problem.title,
-        difficulty: String(difficulty),
-        design: projectContext.journey?.design || null,
-        plan: projectContext.journey?.plan || null,
-      });
-    }
-
-    let implementationPlan = conversationWithUserMessage.implementationPlan;
-    if (String(context.mentorMode || "").toUpperCase() === "PLAN") {
-      const parsedPlan = parseNovaImplementationPlan(responseText);
-      responseText = parsedPlan.message;
-      if (parsedPlan.plan) {
-        await saveNovaImplementationPlan(db, userId, problemId, conversation.conversationId, parsedPlan.plan);
-        implementationPlan = parsedPlan.plan;
-      }
-    }
-
-    responseText = sanitizeNovaMessage(responseText);
-    await appendNovaConversationMessage(db, userId, problemId, conversation.conversationId, "assistant", responseText);
-    return NextResponse.json({
-      ok: true,
-      mode: responseMode,
-      provider: responseProvider,
-      conversationId: conversation.conversationId,
-      implementationPlan,
-      message: responseText,
-    });
   } catch (err: unknown) {
     const status = typeof err === "object" && err !== null && "status" in err && typeof err.status === "number"
       ? err.status

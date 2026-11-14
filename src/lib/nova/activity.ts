@@ -5,6 +5,8 @@ export type NovaActivityType =
   | "file_saved"
   | "file_created"
   | "file_deleted"
+  | "file_renamed"
+  | "folder_created"
   | "proposal_approved"
   | "proposal_rejected"
   | "task_started"

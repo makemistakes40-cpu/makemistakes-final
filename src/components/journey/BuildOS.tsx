@@ -7,7 +7,9 @@ import {
   FileCode,
   FilePlus,
   Folder,
+  FolderPlus,
   Loader2,
+  Pencil,
   Play,
   Copy,
   Trash2,
@@ -132,35 +134,93 @@ function stableProposalId(planId: string, stepId: string, filePath: string, code
   return `proposal-${(hash >>> 0).toString(16)}`;
 }
 
+function FolderItem({
+  node,
+  active,
+  onOpen,
+  depth,
+  collapsedPaths,
+  onToggleCollapse,
+}: {
+  node: { type: "dir"; name: string; path: string; children: FileNode[] };
+  active: string;
+  onOpen: (path: string) => void;
+  depth: number;
+  collapsedPaths: Set<string>;
+  onToggleCollapse: (path: string) => void;
+}) {
+  const isCollapsed = collapsedPaths.has(node.path);
+
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={() => onToggleCollapse(node.path)}
+        className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[11px] text-zinc-400 font-mono hover:text-zinc-200 transition-colors cursor-pointer"
+        style={{ paddingLeft: 8 + depth * 10 }}
+      >
+        <span className="text-[9px] text-zinc-500 w-2.5 shrink-0 select-none">
+          {isCollapsed ? "▶" : "▼"}
+        </span>
+        <Folder className="h-3 w-3 text-green-500/80 shrink-0" />
+        <span className="truncate">{node.name}</span>
+      </button>
+      {!isCollapsed && (
+        <FileTree
+          nodes={node.children}
+          active={active}
+          onOpen={onOpen}
+          depth={depth + 1}
+          collapsedPaths={collapsedPaths}
+          onToggleCollapse={onToggleCollapse}
+        />
+      )}
+    </li>
+  );
+}
+
 function FileTree({
   nodes,
   active,
   onOpen,
   depth = 0,
+  collapsedPaths = new Set(),
+  onToggleCollapse = () => {},
 }: {
   nodes: FileNode[];
   active: string;
   onOpen: (path: string) => void;
   depth?: number;
+  collapsedPaths?: Set<string>;
+  onToggleCollapse?: (path: string) => void;
 }) {
   if (nodes.length === 0) {
-    return <p className="px-2 py-3 text-[11px] text-zinc-500">No workspace files found.</p>;
+    if (depth === 0) {
+      return <p className="px-2 py-3 text-[11px] text-zinc-500">No workspace files found.</p>;
+    }
+    return (
+      <div
+        className="px-2 py-1 text-[10px] text-zinc-600 font-mono italic"
+        style={{ paddingLeft: 8 + depth * 10 }}
+      >
+        (empty)
+      </div>
+    );
   }
 
   return (
     <ul className="space-y-0.5">
       {nodes.map((n) =>
         n.type === "dir" ? (
-          <li key={n.path}>
-            <div
-              className="flex items-center gap-1.5 px-2 py-1 text-[11px] text-zinc-400 font-mono"
-              style={{ paddingLeft: 8 + depth * 10 }}
-            >
-              <Folder className="h-3 w-3 text-green-500/80" />
-              {n.name}
-            </div>
-            <FileTree nodes={n.children} active={active} onOpen={onOpen} depth={depth + 1} />
-          </li>
+          <FolderItem
+            key={n.path}
+            node={n}
+            active={active}
+            onOpen={onOpen}
+            depth={depth}
+            collapsedPaths={collapsedPaths}
+            onToggleCollapse={onToggleCollapse}
+          />
         ) : (
           <li key={n.path}>
             <button
@@ -363,13 +423,25 @@ export default function BuildOS({ problemId, productName: propName, problemData,
   const [tree, setTree] = useState<FileNode[]>([]);
   const [activePath, setActivePath] = useState("app/page.tsx");
   const [content, setContent] = useState("");
+  const unsavedChangesRef = useRef<Record<string, string>>({});
   const latestEditorContent = useRef("");
-  const updateEditorContent = useCallback((nextContent: string) => {
+  const updateEditorContent = useCallback((nextContent: string, forPath?: string) => {
+    const targetPath = forPath || activePath;
     latestEditorContent.current = nextContent;
     setContent(nextContent);
-  }, []);
+    unsavedChangesRef.current[targetPath] = nextContent;
+  }, [activePath]);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
+  const toggleFolderCollapse = useCallback((folderPath: string) => {
+    setCollapsedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(folderPath)) next.delete(folderPath);
+      else next.add(folderPath);
+      return next;
+    });
+  }, []);
 
   // Runtime State Machine
   const [runtimeState, setRuntimeState] = useState<RuntimeState>("IDLE");
@@ -869,7 +941,10 @@ export default function BuildOS({ problemId, productName: propName, problemData,
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Save failed");
-      if (latestEditorContent.current === content) setDirty(false);
+      if (latestEditorContent.current === content) {
+        setDirty(false);
+        delete unsavedChangesRef.current[activePath];
+      }
       pushLog(`Saved ${activePath}`);
       return true;
     } catch (err: any) {
@@ -1209,6 +1284,14 @@ export default function BuildOS({ problemId, productName: propName, problemData,
     if (!skipDirtyCheck && dirty && !(await saveFile())) {
       return;
     }
+    // If in-memory unsaved changes exist for this tab, restore them directly
+    if (unsavedChangesRef.current[filePath] !== undefined) {
+      setActivePath(filePath);
+      updateEditorContent(unsavedChangesRef.current[filePath], filePath);
+      setDirty(true);
+      setOpenTabs((prev) => (prev.includes(filePath) ? prev : [...prev, filePath]));
+      return;
+    }
     const res = await fetch(
       `/api/buildos/files?userId=${encodeURIComponent(userId)}&problemId=${encodeURIComponent(problemId)}&path=${encodeURIComponent(filePath)}`
     );
@@ -1218,7 +1301,7 @@ export default function BuildOS({ problemId, productName: propName, problemData,
       return;
     }
     setActivePath(filePath);
-    updateEditorContent(data.content || "");
+    updateEditorContent(data.content || "", filePath);
     setDirty(false);
     setOpenTabs((prev) => (prev.includes(filePath) ? prev : [...prev, filePath]));
   }
@@ -1282,13 +1365,17 @@ export default function BuildOS({ problemId, productName: propName, problemData,
   const createFile = async () => {
     const name = window.prompt("New file path (e.g. components/Card.tsx)");
     if (!name) return;
+    let clean = name.trim().replace(/^\/+/, "");
+    if (!clean.includes(".")) {
+      clean = `${clean}.tsx`;
+    }
     const res = await fetch("/api/buildos/files", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         userId,
         problemId,
-        path: name.replace(/^\/+/, ""),
+        path: clean,
         content: "// Write your code here\n",
       }),
     });
@@ -1298,13 +1385,14 @@ export default function BuildOS({ problemId, productName: propName, problemData,
       return;
     }
     setTree(data.tree || []);
-    await openFile(name.replace(/^\/+/, ""), true);
+    await openFile(clean, true);
   };
 
   const deleteFile = async () => {
     if (!window.confirm(`Delete ${activePath}?`)) return;
+    const deletedPath = activePath;
     const res = await fetch(
-      `/api/buildos/files?userId=${encodeURIComponent(userId)}&problemId=${encodeURIComponent(problemId)}&path=${encodeURIComponent(activePath)}`,
+      `/api/buildos/files?userId=${encodeURIComponent(userId)}&problemId=${encodeURIComponent(problemId)}&path=${encodeURIComponent(deletedPath)}`,
       { method: "DELETE" }
     );
     const data = await res.json();
@@ -1312,9 +1400,88 @@ export default function BuildOS({ problemId, productName: propName, problemData,
       pushLog(data.error || "Delete failed");
       return;
     }
+    delete unsavedChangesRef.current[deletedPath];
+    const remainingTabs = openTabs.filter((t) => t !== deletedPath);
+    setOpenTabs(remainingTabs);
     setTree(data.tree || []);
-    const next = flattenFiles(data.tree || [])[0];
-    if (next) await openFile(next, true);
+    const treeFiles = flattenFiles(data.tree || []);
+    const next = remainingTabs[remainingTabs.length - 1] || treeFiles[0];
+    if (next) {
+      await openFile(next, true);
+    } else {
+      setActivePath("");
+      setContent("");
+    }
+  };
+
+  const createFolder = async () => {
+    const name = window.prompt("New folder path (e.g. components/ui)");
+    if (!name) return;
+    const clean = name.trim().replace(/^\/+|\/+$/g, "");
+    try {
+      const res = await fetch("/api/buildos/files", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          problemId,
+          path: clean,
+          isFolder: true,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        pushLog(data.error || "Create folder failed");
+        alert(data.error || "Create folder failed");
+        return;
+      }
+      setTree(data.tree || []);
+      pushLog(`Created folder ${clean}`);
+    } catch (err: any) {
+      pushLog(err.message || "Create folder failed");
+    }
+  };
+
+  const renameFile = async () => {
+    const protectedFiles = new Set(["package.json", "app/page.tsx", "app/layout.tsx"]);
+    if (protectedFiles.has(activePath)) {
+      alert(`Cannot rename core file: ${activePath}`);
+      return;
+    }
+    const newName = window.prompt(`Rename "${activePath}" to:`, activePath);
+    if (!newName || newName.trim() === activePath) return;
+
+    if (dirty && !(await saveFile())) return;
+
+    try {
+      const cleanNew = newName.trim().replace(/^\/+/, "");
+      const res = await fetch("/api/buildos/files", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          problemId,
+          oldPath: activePath,
+          newPath: cleanNew,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        pushLog(data.error || "Rename failed");
+        alert(data.error || "Rename failed");
+        return;
+      }
+      setTree(data.tree || []);
+      if (unsavedChangesRef.current[activePath] !== undefined) {
+        unsavedChangesRef.current[cleanNew] = unsavedChangesRef.current[activePath];
+        delete unsavedChangesRef.current[activePath];
+      }
+      setOpenTabs((prev) => prev.map((t) => (t === activePath ? cleanNew : t)));
+      setActivePath(cleanNew);
+      pushLog(`Renamed ${activePath} → ${cleanNew}`);
+    } catch (err: any) {
+      pushLog(err.message || "Rename failed");
+    }
   };
 
   const handleValidateStep = async () => {
@@ -1971,6 +2138,24 @@ export default function BuildOS({ problemId, productName: propName, problemData,
                     </button>
                     <button
                       type="button"
+                      onClick={createFolder}
+                      className="p-1 text-zinc-400 hover:text-green-300 hover:bg-zinc-800/60 rounded"
+                      aria-label="Create folder"
+                      title="New Folder"
+                    >
+                      <FolderPlus className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={renameFile}
+                      className="p-1 text-zinc-400 hover:text-amber-300 hover:bg-zinc-800/60 rounded"
+                      aria-label="Rename active file"
+                      title="Rename Active File"
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
                       onClick={deleteFile}
                       className="p-1 text-zinc-400 hover:text-rose-400 hover:bg-zinc-800/60 rounded"
                       aria-label="Delete active file"
@@ -1981,7 +2166,13 @@ export default function BuildOS({ problemId, productName: propName, problemData,
                   </div>
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto p-2">
-                  <FileTree nodes={tree} active={activePath} onOpen={(path) => openFile(path)} />
+                  <FileTree
+                    nodes={tree}
+                    active={activePath}
+                    onOpen={(path) => openFile(path)}
+                    collapsedPaths={collapsedFolders}
+                    onToggleCollapse={toggleFolderCollapse}
+                  />
                 </div>
               </section>
             </aside>

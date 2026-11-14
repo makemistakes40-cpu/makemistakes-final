@@ -129,6 +129,10 @@ export function writeWorkspaceTextFile(
   if (!isEditableRelativePath(relativePath)) {
     throw new Error("File type not allowed");
   }
+  const MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024; // 2MB
+  if (content.length > MAX_FILE_SIZE_BYTES) {
+    throw new Error("File content exceeds maximum allowed size (2MB)");
+  }
   const abs = resolveWorkspaceFile(root, relativePath);
   ensureDir(path.dirname(abs));
   let finalContent = content;
@@ -145,6 +149,54 @@ export function createWorkspaceFile(
   level: BuildLevel = "Beginner"
 ) {
   writeWorkspaceTextFile(root, relativePath, content, level);
+}
+
+export function createWorkspaceFolder(root: string, relativePath: string) {
+  const normalized = relativePath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  if (!normalized || normalized.includes("\0")) {
+    throw new Error("Invalid folder path");
+  }
+  if (normalized.split("/").some((segment) => segment === ".." || segment === ".")) {
+    throw new Error("Path traversal is not allowed");
+  }
+  if (
+    normalized.startsWith("node_modules") ||
+    normalized.startsWith(".next") ||
+    normalized.startsWith(".git")
+  ) {
+    throw new Error("Folder name not allowed");
+  }
+  const abs = resolveWorkspaceFile(root, normalized);
+  ensureDir(abs);
+}
+
+export function renameWorkspaceFile(
+  root: string,
+  oldRelativePath: string,
+  newRelativePath: string
+) {
+  if (!isEditableRelativePath(oldRelativePath) || !isEditableRelativePath(newRelativePath)) {
+    throw new Error("File type not allowed");
+  }
+  const protectedFiles = new Set(["package.json", "app/page.tsx", "app/layout.tsx"]);
+  if (protectedFiles.has(oldRelativePath.replace(/\\/g, "/"))) {
+    throw new Error("This core file cannot be renamed");
+  }
+  if (protectedFiles.has(newRelativePath.replace(/\\/g, "/"))) {
+    throw new Error("Cannot rename to a protected core file name");
+  }
+  const oldAbs = resolveWorkspaceFile(root, oldRelativePath);
+  const newAbs = resolveWorkspaceFile(root, newRelativePath);
+
+  if (!fs.existsSync(oldAbs)) {
+    throw new Error("File not found");
+  }
+  if (fs.existsSync(newAbs)) {
+    throw new Error("A file with the target name already exists");
+  }
+
+  ensureDir(path.dirname(newAbs));
+  fs.renameSync(oldAbs, newAbs);
 }
 
 export function deleteWorkspaceFile(root: string, relativePath: string) {

@@ -80,6 +80,36 @@ export const JUSTIFIED_INDEXES: IndexDefinition[] = [
     options: { name: "userId_1_problemId_1", unique: true, background: true },
     reason: "Unique completion document constraint per user and problem.",
   },
+  {
+    collection: "nova_user_wallets",
+    spec: { userId: 1 },
+    options: { name: "idx_nova_wallets_userId", unique: true, background: true },
+    reason: "Fast 1:1 user wallet lookup and atomic rolling 24-hour balance reconciliation.",
+  },
+  {
+    collection: "nova_credit_reservations",
+    spec: { reservationId: 1 },
+    options: { name: "idx_nova_reservations_id", unique: true, background: true },
+    reason: "Idempotent reservation lookup and settlement by reservation ID.",
+  },
+  {
+    collection: "nova_credit_reservations",
+    spec: { userId: 1, status: 1 },
+    options: { name: "idx_nova_reservations_userId_status", background: true },
+    reason: "Fast lookup of in-flight active reservations per student.",
+  },
+  {
+    collection: "nova_ai_usage_events",
+    spec: { userId: 1, timestamp: -1 },
+    options: { name: "idx_nova_usage_userId_timestamp", background: true },
+    reason: "High-performance time-series aggregation of AI expenditure and token usage per student.",
+  },
+  {
+    collection: "nova_pricing_config",
+    spec: { isCurrent: 1 },
+    options: { name: "idx_nova_pricing_isCurrent", background: true },
+    reason: "Instant resolution of the currently active versioned pricing rules.",
+  },
 ];
 
 export interface EnsureIndexesResult {
