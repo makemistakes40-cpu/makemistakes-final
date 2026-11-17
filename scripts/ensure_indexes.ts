@@ -96,6 +96,19 @@ async function runIndexMigration() {
       verifiedAll = false;
     }
 
+    // 2b. Explicitly assert partialFilterExpression matches expected definition
+    const expectedPartial = JSON.stringify(def.options.partialFilterExpression ?? undefined);
+    const actualPartial = JSON.stringify(
+      (targetIndex as Record<string, unknown>).partialFilterExpression ?? undefined
+    );
+    if (expectedPartial !== actualPartial) {
+      console.error(
+        `  ❌ PARTIAL FILTER MISMATCH on ${def.collection}.${targetIndex.name}:` +
+          ` expected partial=${expectedPartial}, got partial=${actualPartial}`
+      );
+      verifiedAll = false;
+    }
+
     // 3. Confirm index name matches expected definition unless safely aliased
     if (targetIndex.name !== def.options.name && !keyMatches) {
       console.error(
@@ -104,11 +117,11 @@ async function runIndexMigration() {
       verifiedAll = false;
     }
 
-    if (keyMatches && expectedUnique === actualUnique) {
+    if (keyMatches && expectedUnique === actualUnique && expectedPartial === actualPartial) {
       console.log(
         `  ✓ Verified on ${def.collection}: "${targetIndex.name}" | Keys: ${JSON.stringify(
           targetIndex.key
-        )} | unique=${actualUnique}`
+        )} | unique=${actualUnique} | partial=${actualPartial}`
       );
     }
   }

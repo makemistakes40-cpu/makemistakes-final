@@ -98,6 +98,57 @@ export const DEFAULT_PRICING_CONFIG: NovaPricingConfig = {
   updatedAt: new Date("2026-01-01T00:00:00.000Z"),
 };
 
+export function parseSemver(version: string): [number, number, number] {
+  const [major = 1, minor = 0, patch = 0] = String(version || "")
+    .replace(/^v/, "")
+    .split(".")
+    .map((n) => Number(n) || 0);
+  return [major, minor, patch];
+}
+
+/**
+ * Compares two version strings ("v1.2.3").
+ * Returns positive if a > b, negative if a < b, zero if equal.
+ */
+export function compareVersions(a: string, b: string): number {
+  const av = parseSemver(a);
+  const bv = parseSemver(b);
+  for (let i = 0; i < 3; i++) {
+    if (av[i] !== bv[i]) return av[i] - bv[i];
+  }
+  return 0;
+}
+
+/**
+ * Merges a stored pricing document over DEFAULT_PRICING_CONFIG so partial documents
+ * are never structurally broken. Used by the read path and by pricing updates.
+ */
+export function mergePricingDoc(doc: NovaPricingConfig): NovaPricingConfig {
+  return {
+    ...DEFAULT_PRICING_CONFIG,
+    ...doc,
+    tierAllocations: {
+      ...DEFAULT_PRICING_CONFIG.tierAllocations,
+      ...(doc.tierAllocations || {}),
+    },
+    models: {
+      ...DEFAULT_PRICING_CONFIG.models,
+      ...(doc.models || {}),
+    },
+  };
+}
+
+/**
+ * Deterministically selects the active pricing document from a set of "current" docs.
+ * When multiple current docs exist (a data-integrity violation), we select the highest
+ * version so behavior is predictable while the condition is surfaced via logging.
+ */
+export function selectCurrentPricingDoc(currentDocs: NovaPricingConfig[]): NovaPricingConfig | null {
+  if (!currentDocs || currentDocs.length === 0) return null;
+  if (currentDocs.length === 1) return currentDocs[0];
+  return [...currentDocs].sort((a, b) => compareVersions(b.version, a.version))[0];
+}
+
 let cachedConfig: NovaPricingConfig | null = null;
 let lastCacheFetchTime = 0;
 const CACHE_TTL_MS = 60_000; // 1 minute in-memory cache
@@ -110,25 +161,36 @@ export async function getEffectivePricingConfig(db?: Db | null): Promise<NovaPri
 
   if (db) {
     try {
-      const doc = await db.collection<NovaPricingConfig>("nova_pricing_config").findOne({ isCurrent: true });
+      const currentDocs = await db
+        .collection<NovaPricingConfig>("nova_pricing_config")
+        .find({ isCurrent: true })
+        .toArray();
+
+      if (currentDocs.length === 0) {
+        console.warn(
+          "[nova-pricing] PRODUCTION WARNING: no current pricing config document found in " +
+            "nova_pricing_config. Falling back to DEFAULT_PRICING_CONFIG."
+        );
+      } else if (currentDocs.length > 1) {
+        console.error(
+          `[nova-pricing] PRODUCTION ERROR: ${currentDocs.length} current pricing config documents ` +
+            "detected (expected exactly 1). Selecting the highest-version document; please reconcile.",
+          { versions: currentDocs.map((d) => d.version) }
+        );
+      }
+
+      const doc = selectCurrentPricingDoc(currentDocs);
       if (doc) {
-        cachedConfig = {
-          ...DEFAULT_PRICING_CONFIG,
-          ...doc,
-          tierAllocations: {
-            ...DEFAULT_PRICING_CONFIG.tierAllocations,
-            ...(doc.tierAllocations || {}),
-          },
-          models: {
-            ...DEFAULT_PRICING_CONFIG.models,
-            ...(doc.models || {}),
-          },
-        };
+        cachedConfig = mergePricingDoc(doc);
         lastCacheFetchTime = now;
         return cachedConfig;
       }
-    } catch {
-      // In-memory fallback if collection or DB error
+    } catch (err) {
+      // In-memory fallback if collection or DB error (development fallback preserved)
+      console.warn(
+        "[nova-pricing] Failed to read pricing config; falling back to DEFAULT_PRICING_CONFIG.",
+        err
+      );
     }
   }
 

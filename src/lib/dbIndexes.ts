@@ -1,4 +1,4 @@
-import type { Db, IndexDescription } from "mongodb";
+import type { Db, Document, IndexDescription } from "mongodb";
 import { getDb } from "./mongodb";
 
 export interface IndexDefinition {
@@ -9,6 +9,7 @@ export interface IndexDefinition {
     unique?: boolean;
     background?: boolean;
     sparse?: boolean;
+    partialFilterExpression?: Record<string, unknown>;
   };
   reason: string;
 }
@@ -119,8 +120,19 @@ export const JUSTIFIED_INDEXES: IndexDefinition[] = [
   {
     collection: "nova_pricing_config",
     spec: { isCurrent: 1 },
-    options: { name: "idx_nova_pricing_isCurrent", background: true },
-    reason: "Instant resolution of the currently active versioned pricing rules.",
+    options: {
+      name: "idx_nova_pricing_isCurrent",
+      unique: true,
+      background: true,
+      partialFilterExpression: { isCurrent: { $eq: true } },
+    },
+    reason: "Enforces exactly ONE current pricing document (preserving full versioned history) and enables instant resolution of the active pricing rules.",
+  },
+  {
+    collection: "nova_pricing_config",
+    spec: { version: 1 },
+    options: { name: "idx_nova_pricing_version", unique: true, background: true },
+    reason: "Guarantees each pricing version is created at most once, preventing concurrent updates from producing duplicate versions.",
   },
 ];
 
@@ -153,15 +165,6 @@ export function matchesKeySpecAndOrder(
     }
   }
   return true;
-}
-
-/**
- * Checks whether an index with the exact key specification already exists.
- */
-function hasMatchingKey(existingIndexes: IndexDescription[], targetSpec: Record<string, any>): boolean {
-  return existingIndexes.some((idx) =>
-    matchesKeySpecAndOrder(idx.key as Record<string, any>, targetSpec)
-  );
 }
 
 /**
@@ -210,13 +213,16 @@ export async function ensureAppIndexes(targetDb?: Db): Promise<EnsureIndexesResu
           def.spec
         );
         const uniqueMatch = !!existingByName.unique === !!def.options.unique;
+        const partialMatch =
+          JSON.stringify(existingByName.partialFilterExpression ?? undefined) ===
+          JSON.stringify(def.options.partialFilterExpression ?? undefined);
 
-        if (keysMatch && uniqueMatch) {
+        if (keysMatch && uniqueMatch && partialMatch) {
           results.push({
             collection: def.collection,
             name: def.options.name,
             status: "already_exists",
-            details: "Index with identical name, key specification, and options already exists.",
+            details: "Index with identical name, key specification, unique, and partial-filter options already exists.",
           });
           continue;
         } else {
@@ -226,19 +232,39 @@ export async function ensureAppIndexes(targetDb?: Db): Promise<EnsureIndexesResu
             status: "error",
             details: `Index exists with name "${def.options.name}" but has conflicting keys (${JSON.stringify(
               existingByName.key
-            )}) or options (unique=${!!existingByName.unique}).`,
+            )}) or options (unique=${!!existingByName.unique}, partial=${JSON.stringify(
+              existingByName.partialFilterExpression ?? undefined
+            )}).`,
           });
           continue;
         }
       }
 
       // Check if an index with identical key specification already exists under another name
-      if (hasMatchingKey(existingIndexes, def.spec)) {
+      const matchingKeyEntry = existingIndexes.find((idx) =>
+        matchesKeySpecAndOrder(idx.key, def.spec)
+      );
+      if (matchingKeyEntry) {
+        const uniqueMatch = !!matchingKeyEntry.unique === !!def.options.unique;
+        const partialMatch =
+          JSON.stringify(matchingKeyEntry.partialFilterExpression ?? undefined) ===
+          JSON.stringify(def.options.partialFilterExpression ?? undefined);
+        if (uniqueMatch && partialMatch) {
+          results.push({
+            collection: def.collection,
+            name: def.options.name,
+            status: "skipped_duplicate_keys",
+            details: "Equivalent index keys already exist under a different name.",
+          });
+          continue;
+        }
         results.push({
           collection: def.collection,
           name: def.options.name,
-          status: "skipped_duplicate_keys",
-          details: "Equivalent index keys already exist under a different name.",
+          status: "error",
+          details: `Index exists with equivalent keys but conflicting options (unique=${!!matchingKeyEntry.unique}, partial=${JSON.stringify(
+            matchingKeyEntry.partialFilterExpression ?? undefined
+          )}). Resolve before applying required index ${def.options.name}.`,
         });
         continue;
       }
@@ -251,15 +277,19 @@ export async function ensureAppIndexes(targetDb?: Db): Promise<EnsureIndexesResu
             ? `$${keyFields[0]}`
             : Object.fromEntries(keyFields.map((k) => [k, `$${k}`]));
 
+        const duplicateCheckPipeline: Document[] = [];
+        if (def.options.partialFilterExpression) {
+          duplicateCheckPipeline.push({ $match: def.options.partialFilterExpression });
+        }
+        duplicateCheckPipeline.push(
+          { $group: { _id: groupId, count: { $sum: 1 } } },
+          { $match: { count: { $gt: 1 } } },
+          { $limit: 1 }
+        );
+
         let duplicates: any[] = [];
         try {
-          duplicates = await collection
-            .aggregate([
-              { $group: { _id: groupId, count: { $sum: 1 } } },
-              { $match: { count: { $gt: 1 } } },
-              { $limit: 1 },
-            ])
-            .toArray();
+          duplicates = await collection.aggregate(duplicateCheckPipeline).toArray();
         } catch (aggErr: any) {
           if (
             aggErr?.code === 26 ||

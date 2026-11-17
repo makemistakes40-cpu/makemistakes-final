@@ -1,9 +1,13 @@
-import type { Db } from "mongodb";
+import type { Db, MongoClient } from "mongodb";
 import {
+  DEFAULT_PRICING_CONFIG,
   clearPricingConfigCache,
-  getEffectivePricingConfig,
+  mergePricingDoc,
+  parseSemver,
+  selectCurrentPricingDoc,
   type NovaPricingConfig,
 } from "./pricingConfig";
+import { isClientTransactionCapable } from "./reservationEngine";
 
 export interface UpdatePricingConfigInput {
   creditValueInr?: number;
@@ -102,57 +106,92 @@ export function validatePricingConfigInput(input: UpdatePricingConfigInput): voi
 
 /**
  * Updates pricing configuration with full versioning and audit history.
- * Never requires code deployment to adjust pricing or disable a failing provider.
+ *
+ * Atomicity: deactivating the previous current document and inserting the new version run
+ * inside a single multi-document transaction. If anything fails, the whole transaction
+ * rolls back.
+ *
+ * Fail-closed: if the MongoDB topology cannot run multi-document transactions, we throw
+ * and NEVER fall back to non-transactional writes (mirrors credit settlement enforcement).
+ *
+ * Version safety: the next version is derived from the latest current document read inside
+ * the transaction, and the unique index on `version` guarantees concurrent updates cannot
+ * produce duplicate versions (the loser rolls back on a duplicate-key/WriteConflict).
  */
 export async function updatePricingConfig(
   db: Db,
   input: UpdatePricingConfigInput
 ): Promise<NovaPricingConfig> {
   validatePricingConfigInput(input);
-  const current = await getEffectivePricingConfig(db);
-  const now = new Date();
 
-  // Generate new semver version
-  const [major, minor, patch] = current.version.replace(/^v/, "").split(".").map(Number);
-  const nextVersion = `v${major}.${minor}.${(patch || 0) + 1}`;
+  const client =
+    (db as unknown as { client?: MongoClient }).client ||
+    (db as unknown as { s?: { client?: MongoClient } }).s?.client;
 
-  const updated: NovaPricingConfig = {
-    ...current,
-    version: nextVersion,
-    isCurrent: true,
-    creditValueInr: input.creditValueInr ?? current.creditValueInr,
-    pricingMultiplier: input.pricingMultiplier ?? current.pricingMultiplier,
-    usdToInrRate: input.usdToInrRate ?? current.usdToInrRate,
-    tierAllocations: {
-      FREE: {
-        ...current.tierAllocations.FREE,
-        ...(input.tierAllocations?.FREE || {}),
-      },
-      BUILDER: {
-        ...current.tierAllocations.BUILDER,
-        ...(input.tierAllocations?.BUILDER || {}),
-      },
-      PRO: {
-        ...current.tierAllocations.PRO,
-        ...(input.tierAllocations?.PRO || {}),
-      },
-    },
-    models: input.models ?? current.models,
-    emergencyDisabledProviders:
-      input.emergencyDisabledProviders ?? current.emergencyDisabledProviders,
-    updatedAt: now,
-    updatedBy: input.updatedBy,
-  };
+  if (!client || !isClientTransactionCapable(client)) {
+    throw Object.assign(
+      new Error(
+        "TRANSACTION_UNAVAILABLE: Multi-document transactions are required for pricing updates " +
+          "to guarantee that exactly one pricing version is current. No non-transactional " +
+          "fallback was attempted."
+      ),
+      { code: "TRANSACTION_UNAVAILABLE" }
+    );
+  }
 
   const collection = db.collection<NovaPricingConfig>("nova_pricing_config");
+  const session = client.startSession();
+  let updated!: NovaPricingConfig;
 
-  // Mark prior configs as not current
-  await collection.updateMany({ isCurrent: true }, { $set: { isCurrent: false } });
+  try {
+    await session.withTransaction(async () => {
+      // Read current document(s) inside the transaction (bypassing the cache) so the next
+      // version is correct even if another pricing update committed concurrently. If
+      // pre-existing duplicate current documents exist (a data-integrity violation), we
+      // deterministically base the next version on the highest one so we never collide with
+      // an already-existing version.
+      const currentDocs = await collection.find({ isCurrent: true }).toArray();
+      const currentDoc = selectCurrentPricingDoc(currentDocs);
+      const base = currentDoc ? mergePricingDoc(currentDoc) : DEFAULT_PRICING_CONFIG;
 
-  // Insert new version
-  await collection.insertOne(updated);
+      const [major, minor, patch] = parseSemver(base.version);
+      const nextVersion = `v${major}.${minor}.${patch + 1}`;
 
-  // Clear in-memory cache
+      updated = {
+        ...base,
+        version: nextVersion,
+        isCurrent: true,
+        creditValueInr: input.creditValueInr ?? base.creditValueInr,
+        pricingMultiplier: input.pricingMultiplier ?? base.pricingMultiplier,
+        usdToInrRate: input.usdToInrRate ?? base.usdToInrRate,
+        tierAllocations: {
+          FREE: { ...base.tierAllocations.FREE, ...(input.tierAllocations?.FREE || {}) },
+          BUILDER: {
+            ...base.tierAllocations.BUILDER,
+            ...(input.tierAllocations?.BUILDER || {}),
+          },
+          PRO: { ...base.tierAllocations.PRO, ...(input.tierAllocations?.PRO || {}) },
+        },
+        models: input.models ?? base.models,
+        emergencyDisabledProviders:
+          input.emergencyDisabledProviders ?? base.emergencyDisabledProviders,
+        updatedAt: new Date(),
+        updatedBy: input.updatedBy,
+      };
+
+      // Deactivate the previous current configuration and insert the new version atomically.
+      await collection.updateMany(
+        { isCurrent: true },
+        { $set: { isCurrent: false } },
+        { session }
+      );
+      await collection.insertOne(updated, { session });
+    });
+  } finally {
+    await session.endSession();
+  }
+
+  // Clear in-memory cache only after a successful commit.
   clearPricingConfigCache();
 
   return updated;
