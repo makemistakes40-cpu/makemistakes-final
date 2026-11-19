@@ -82,6 +82,22 @@ export class EmailService {
 
     const smtpAccounts = this.getSmtpAccounts();
 
+    // Aggregated provider failures for server-side diagnostics. Never exposed to
+    // the client (publicOtpError hides provider detail by design). Logs only
+    // non-sensitive identifiers: provider name, SMTP account index, HTTP status,
+    // and a sanitized error code. Full addresses and raw error messages are
+    // never logged.
+    const providerFailures: string[] = [];
+    const sanitizeCode = (value: unknown): string => {
+      if (value === undefined || value === null || value === "" || value === "provider error") {
+        return "unknown";
+      }
+      return String(value);
+    };
+    const recordFailure = (label: string, code?: unknown) => {
+      providerFailures.push(`${label}: code=${sanitizeCode(code)}`);
+    };
+
     // 1. Round-Robin Custom Gmail / SMTP Transports (Delivers to ANY email address)
     if (smtpAccounts.length > 0) {
       // Round-robin: start at the current pointer but try EVERY configured account
@@ -94,7 +110,8 @@ export class EmailService {
         ...smtpAccounts.slice(0, start),
       ];
 
-      for (const selectedAccount of orderedAccounts) {
+      for (let i = 0; i < orderedAccounts.length; i++) {
+        const selectedAccount = orderedAccounts[i];
         try {
           const transporter = getOrCreateTransporter({
             host: selectedAccount.host,
@@ -123,7 +140,8 @@ export class EmailService {
           return { success: true };
         } catch (err: unknown) {
           const code = err instanceof Error && "code" in err ? err.code : "provider error";
-          console.warn("[SMTP Warning] Configured SMTP delivery failed:", code);
+          console.warn(`[SMTP Warning] SMTP account #${i} delivery failed (code=${sanitizeCode(code)})`);
+          recordFailure(`SMTP account #${i}`, code);
         }
       }
     }
@@ -152,12 +170,11 @@ export class EmailService {
           console.log("[Resend API Success] Verification email accepted.");
           return { success: true };
         }
-        console.warn("[Resend API Error Notice]:", response.status);
-      } catch (err: unknown) {
-        console.warn(
-          "Resend API delivery failed:",
-          err instanceof Error ? err.name : "provider error"
-        );
+        console.warn(`[Resend API Error Notice] status=${response.status}`);
+        recordFailure("Resend API", response.status);
+      } catch {
+        console.warn("[Resend API] delivery failed (network/connectivity error)");
+        recordFailure("Resend API");
       }
     }
 
@@ -177,11 +194,14 @@ export class EmailService {
           html,
         });
         return { success: true, previewUrl: nodemailer.getTestMessageUrl(info) || undefined };
-      } catch (error) {
-        console.error("Development test-email delivery failed:", error);
+      } catch {
+        console.error("Development test-email delivery failed (provider error suppressed)");
       }
     }
 
+    console.error(
+      `[EmailDeliveryFailed] Verification email delivery failed; provider failures: ${providerFailures.join(" | ") || "none configured"}`
+    );
     throw new Error("EMAIL_DELIVERY_FAILED: Unable to send verification email.");
   }
 }
