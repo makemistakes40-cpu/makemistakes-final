@@ -52,6 +52,7 @@ model User {
   emailVerified Boolean   @default(true)
   name          String?
   role          String    @default("student")
+  entitledProblemId String? // set-once free-tier entitlement (P000001 or grandfathered journey)
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 

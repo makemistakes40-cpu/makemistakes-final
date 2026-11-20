@@ -3,6 +3,7 @@ import { getDb } from "@/lib/mongodb";
 import { getAuthSession } from "@/lib/authSession";
 import { evaluateUserUnlock, isProblemLocked } from "@/lib/unlockEligibility";
 import { applyNoStoreHeaders, applyPublicCatalogCacheHeaders } from "@/lib/cacheHeaders";
+import { resolveProblemAccess } from "@/lib/problemAccess";
 
 function escapeRegex(text: string): string {
   return text.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
@@ -127,7 +128,7 @@ export async function GET(req: Request) {
     // Execute queries in parallel: unlock evaluation (using shared engine), total count, paginated slice
     // Fetch limit + 1 items to determine with exact precision whether another page exists
     const dbStartTime = performance.now();
-    const [unlockData, totalCount, rawProblemsWithExtra] = await Promise.all([
+    const [unlockData, totalCount, rawProblemsWithExtra, accessState] = await Promise.all([
       evaluateUserUnlock(db, hasAuthSession ? userFilter : null),
       problemsCollection.countDocuments(query),
       problemsCollection
@@ -155,6 +156,11 @@ export async function GET(req: Request) {
         .skip(skip)
         .limit(limit + 1)
         .toArray(),
+      resolveProblemAccess({
+        db,
+        userIds: authIdentifiers,
+        sessionUserId: (session?.userId?.trim() as string | null) || null,
+      }),
     ]);
     const dbEndTime = performance.now();
 
@@ -193,11 +199,19 @@ export async function GET(req: Request) {
       }
 
       const pDiff = p.difficulty || p.learning?.level || null;
-      const isLocked = isProblemLocked({
+      const advancedLocked = isProblemLocked({
         difficulty: pDiff,
         advancedUnlocked: unlockProgress.advancedUnlocked,
         userStatus,
       });
+      const freeTierLocked =
+        hasAuthSession && !accessState.isPaid && !accessState.freeAccessible.has(pid);
+      const isLocked = advancedLocked || freeTierLocked;
+      const lockedReason = freeTierLocked
+        ? "upgrade"
+        : advancedLocked
+        ? "difficulty"
+        : undefined;
 
       return {
         problemId: pid,
@@ -222,6 +236,7 @@ export async function GET(req: Request) {
         currentPhase,
         totalPhases: 8,
         isLocked,
+        lockedReason,
       };
     });
 

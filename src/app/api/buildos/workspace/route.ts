@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { ensureWorkspace } from "@/lib/buildos/workspaceService";
 import { getAuthenticatedIdentity } from "@/lib/security/sessionIdentity";
 import { findOwnedWorkspace } from "@/lib/security/workspaceOwnership";
+import { resolveProblemAccess } from "@/lib/problemAccess";
+import { getDb } from "@/lib/mongodb";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -39,6 +41,23 @@ export async function POST(req: Request) {
     const problemId = String(body.problemId || "").trim();
     const forceReinstall = Boolean(body.forceReinstall);
     if (!problemId) return bad("problemId is required");
+
+    // MakeMistakes-owned eligibility: free-tier students may only create a
+    // workspace for their single entitled problem (P000001 or a grandfathered
+    // unfinished one). This prevents workspace creation from bypassing the
+    // upgrade gate for additional problems.
+    const db = await getDb();
+    const access = await resolveProblemAccess({
+      db,
+      userIds: identity.userIds,
+      sessionUserId: identity.primaryUserId || null,
+    });
+    if (!access.isPaid && !access.freeAccessible.has(problemId)) {
+      return bad(
+        "This challenge is part of a paid plan. Upgrade to access additional problems.",
+        403
+      );
+    }
 
     const owned = await findOwnedWorkspace(identity, problemId);
     const userId = owned?.userId || identity.primaryUserId;

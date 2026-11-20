@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
-import { sortProblemsNumerically } from "@/lib/problemId";
+import { sortProblemsNumerically, DEFAULT_PROBLEM_ID } from "@/lib/problemId";
 import { applyNoStoreHeaders } from "@/lib/cacheHeaders";
 import { getAuthenticatedIdentity } from "@/lib/security/sessionIdentity";
 
@@ -55,6 +55,10 @@ export async function GET(req: Request) {
       }
     }
 
+    // Resume any unfinished journey exactly as-is (never discard existing
+    // progress). Brand-new students (no unfinished journey) fall through to the
+    // canonical P000001 challenge below.
+
     let resultProblemId: string | null = null;
     let resultStep: number = 1;
     let isUnfinished: boolean = false;
@@ -78,15 +82,14 @@ export async function GET(req: Request) {
       isUnfinished = true;
       metaDoc = problemsMap.get(unfinishedDoc.problemId);
     } else {
-      // Find the first uncompleted problem statement
-      for (const prob of allProblems) {
-        if (!completedSet.has(prob.problemId)) {
-          metaDoc = prob;
-          resultProblemId = prob.problemId;
-          resultStep = 1;
-          isUnfinished = false;
-          break;
-        }
+      // Canonical single-problem mode: every student without an unfinished journey
+      // is directed to the single global P000001 challenge (never auto-advanced).
+      const canonicalDoc = problemsMap.get(DEFAULT_PROBLEM_ID);
+      if (canonicalDoc) {
+        metaDoc = canonicalDoc;
+        resultProblemId = DEFAULT_PROBLEM_ID;
+        resultStep = 1;
+        isUnfinished = false;
       }
     }
 

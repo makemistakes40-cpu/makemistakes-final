@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { getAuthSession } from "@/lib/authSession";
+import { normalizeProblemId } from "@/lib/problemId";
 import { evaluateUserUnlock, formatAdvancedLockError } from "@/lib/unlockEligibility";
+import { resolveProblemAccess } from "@/lib/problemAccess";
 
 /** Normalize Mongo problem docs for the Build engine (difficulty / learning / build). */
 function toProblemPayload(doc: Record<string, any>) {
@@ -54,6 +56,29 @@ export async function GET(req: Request) {
 
     const db = await getDb();
     const collection = db.collection("problems");
+
+    // MakeMistakes-owned free-tier eligibility gate. Free-tier students may
+    // access the canonical P000001 challenge plus any problem they have already
+    // started; attempting to start any other problem requires an upgrade.
+    if (hasUser) {
+      const access = await resolveProblemAccess({
+        db,
+        userIds: authIdentifiers,
+        sessionUserId: (session?.userId?.trim() as string | null) || null,
+      });
+      const pid = normalizeProblemId(id);
+      if (!access.isPaid && !access.freeAccessible.has(pid)) {
+        return NextResponse.json(
+          {
+            locked: true,
+            upgradeRequired: true,
+            error:
+              "This challenge is part of a paid plan. Upgrade to access additional problems.",
+          },
+          { status: 403 }
+        );
+      }
+    }
 
     const problem: any = await collection.findOne({ problemId: id });
 

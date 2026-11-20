@@ -52,6 +52,7 @@ interface ProductCatalogItem {
   currentPhase: number;
   totalPhases: number;
   isLocked?: boolean;
+  lockedReason?: "upgrade" | "difficulty" | undefined;
 }
 
 interface UnlockProgress {
@@ -223,6 +224,9 @@ export default function BuildOSPage() {
   // Selected detail modal
   const [selectedProduct, setSelectedProduct] = useState<ProductCatalogItem | null>(null);
 
+  // Dismissible free-tier upgrade prompt (shown when a locked problem is clicked)
+  const [upgradePrompt, setUpgradePrompt] = useState<ProductCatalogItem | null>(null);
+
   // Stable callbacks for memoized cards
   const handleSelectProduct = useCallback((product: ProductCatalogItem) => {
     setSelectedProduct(product);
@@ -230,7 +234,11 @@ export default function BuildOSPage() {
 
   const handleStartOrContinue = useCallback(
     (product: ProductCatalogItem) => {
-      if (product.isLocked) return;
+      if (product.isLocked) {
+        // Show a dismissible upgrade prompt instead of forcing navigation to pricing.
+        if (product.lockedReason === "upgrade") setUpgradePrompt(product);
+        return;
+      }
       router.push(`/journey/${product.problemId}?step=${product.currentPhase || 1}`);
     },
     [router]
@@ -959,7 +967,15 @@ export default function BuildOSPage() {
                 type="button"
                 disabled={!!selectedProduct.isLocked}
                 onClick={() => {
-                  if (selectedProduct.isLocked) return;
+                  if (selectedProduct.isLocked) {
+                    if (selectedProduct.lockedReason === "upgrade") {
+                      // Show dismissible upgrade prompt; keep the detail modal open state.
+                      const lockedCopy = selectedProduct;
+                      setSelectedProduct(null);
+                      setUpgradePrompt(lockedCopy);
+                    }
+                    return;
+                  }
                   const pid = selectedProduct.problemId;
                   const step = selectedProduct.currentPhase || 1;
                   setSelectedProduct(null);
@@ -981,6 +997,66 @@ export default function BuildOSPage() {
                     : "Start Building This Problem"}
                 </span>
                 {!selectedProduct.isLocked && <ArrowRight className="h-4 w-4" />}
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ================================================================ */}
+      {/* DISMISSIBLE FREE-TIER UPGRADE PROMPT                            */}
+      {/* ================================================================ */}
+      {upgradePrompt && (
+        <div className="fixed inset-0 bg-zinc-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 sm:p-6">
+          <div className="bg-white border border-zinc-200 rounded-3xl max-w-md w-full p-6 sm:p-8 space-y-5 shadow-2xl animate-in fade-in zoom-in-95 duration-200">
+
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex items-center gap-2">
+                <span className="h-10 w-10 rounded-2xl bg-teal-50 border border-teal-200 flex items-center justify-center text-teal-700">
+                  <Lock className="h-5 w-5" />
+                </span>
+                <h3 className="font-serif font-bold text-lg text-zinc-900 tracking-tight">
+                  Free Plan Limit
+                </h3>
+              </div>
+              <button
+                onClick={() => setUpgradePrompt(null)}
+                className="p-2 rounded-full bg-zinc-100 hover:bg-zinc-200 text-zinc-600 transition-colors cursor-pointer shrink-0"
+                aria-label="Dismiss upgrade prompt"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2 text-xs font-sans text-zinc-700 leading-relaxed">
+              <p>
+                Your free plan includes <strong>one problem statement</strong>.
+                You&apos;re already building{" "}
+                <strong>{upgradePrompt.problemId}</strong>. To unlock additional challenges
+                like <strong>{upgradePrompt.title}</strong>, you&apos;ll need to upgrade.
+              </p>
+              <p className="text-zinc-500">
+                Your current problem, workspace, progress, and submissions stay fully intact
+                either way.
+              </p>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2.5 pt-1">
+              <button
+                type="button"
+                onClick={() => router.push("/pricing")}
+                className="flex-1 inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-teal-800 hover:bg-teal-700 text-white font-semibold text-xs transition-all shadow-sm cursor-pointer"
+              >
+                <span>Upgrade</span>
+                <ArrowRight className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setUpgradePrompt(null)}
+                className="flex-1 px-5 py-2.5 rounded-xl bg-zinc-100 hover:bg-zinc-200 text-zinc-700 text-xs font-semibold transition-colors cursor-pointer"
+              >
+                Maybe Later
               </button>
             </div>
 

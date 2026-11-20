@@ -5,6 +5,7 @@ import { getAuthSession } from "@/lib/authSession";
 import { redactGithubAccessToken } from "@/lib/security/githubOAuth";
 import { redactVercelAccessToken } from "@/lib/security/vercelOAuth";
 import { migrateStoredJourneyPhase } from "@/lib/nova/projectProgress";
+import { resolveProblemAccess } from "@/lib/problemAccess";
 
 const COLLECTION_NAME = "user_journeys";
 async function getCollection() {
@@ -166,6 +167,28 @@ export async function GET(req: Request) {
       ? { userId: authIdentifiers[0] }
       : { userId: { $in: authIdentifiers } };
 
+    // MakeMistakes-owned eligibility: free-tier students may only load a journey
+    // for their single entitled problem (P000001 or a grandfathered unfinished one).
+    const db = await getDb();
+    const access = await resolveProblemAccess({
+      db,
+      userIds: authIdentifiers,
+      sessionUserId: (session.userId?.trim() as string | null) || null,
+    });
+    if (!access.isPaid && !access.freeAccessible.has(problemId)) {
+      return applyNoStoreHeaders(
+        NextResponse.json(
+          {
+            locked: true,
+            upgradeRequired: true,
+            error:
+              "This challenge is part of a paid plan. Upgrade to access additional problems.",
+          },
+          { status: 403 }
+        )
+      );
+    }
+
     const res = await getCollection();
     const journey = await res.collection.findOne({ ...userQuery, problemId });
 
@@ -253,6 +276,30 @@ export async function POST(req: Request) {
         NextResponse.json(
           { error: "Missing required 'problemId' parameter" },
           { status: 400 }
+        )
+      );
+    }
+
+    // MakeMistakes-owned eligibility: free-tier students may only create/save a
+    // journey for their single entitled problem (P000001 or a grandfathered
+    // unfinished one). This prevents journey creation from bypassing the upgrade
+    // gate for additional problems.
+    const db = await getDb();
+    const access = await resolveProblemAccess({
+      db,
+      userIds: authIdentifiers,
+      sessionUserId: (session.userId?.trim() as string | null) || null,
+    });
+    if (!access.isPaid && !access.freeAccessible.has(problemId)) {
+      return applyNoStoreHeaders(
+        NextResponse.json(
+          {
+            locked: true,
+            upgradeRequired: true,
+            error:
+              "This challenge is part of a paid plan. Upgrade to access additional problems.",
+          },
+          { status: 403 }
         )
       );
     }

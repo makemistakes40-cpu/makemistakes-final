@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import {
   sortProblemsNumerically,
-  parseProblemNumber,
   normalizeProblemId,
+  DEFAULT_PROBLEM_ID,
 } from "@/lib/problemId";
 import { applyNoStoreHeaders } from "@/lib/cacheHeaders";
 import { getAuthenticatedIdentity } from "@/lib/security/sessionIdentity";
@@ -105,26 +105,11 @@ export async function POST(req: Request) {
 
     sortProblemsNumerically(allProblems);
 
-    const currentNum = parseProblemNumber(currentId);
-
-    // 1. Prefer immediate numerical successor (P000001 -> P000002 -> P000003)
-    let nextProblemDoc: any = allProblems.find((prob: any) => {
-      const num = parseProblemNumber(prob.problemId);
-      return num === currentNum + 1;
-    });
-
-    // 2. Fallback: first uncompleted problem after current
-    if (!nextProblemDoc) {
-      nextProblemDoc = allProblems.find((prob: any) => {
-        const num = parseProblemNumber(prob.problemId);
-        return num > currentNum && !completedSet.has(prob.problemId);
-      });
-    }
-
-    // 3. Fallback: first uncompleted problem overall
-    if (!nextProblemDoc) {
-      nextProblemDoc = allProblems.find((prob: any) => !completedSet.has(prob.problemId));
-    }
+    // MakeMistakes-owned progression: there is NO automatic progression.
+    // Completing any problem finishes that journey and returns the student to
+    // the dashboard (journeyComplete: true). The catalog/next-problem choice is
+    // left to MakeMistakes access rules, not to silent auto-advancement.
+    let nextProblemDoc: any = null;
 
     if (
       nextProblemDoc &&
