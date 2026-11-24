@@ -204,6 +204,69 @@ export default function CheckoutModal({
 
   const handleSimulatePayment = async () => {
     if (!orderData) return;
+
+    // Cashfree hosted checkout: open the official Cashfree JS SDK v3 with the
+    // backend-generated payment_session_id (server-verified on return).
+    if (orderData.gateway === "CASHFREE" && orderData.paymentSessionId) {
+      // If the order was already processed by the gateway, activate directly.
+      try {
+        const res = await fetch("/api/payment/cashfree-verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ orderId: orderData.orderId }),
+        });
+        const data = await res.json();
+        if (data.alreadyProcessed) {
+          setActivationResult(data);
+          setStep("SUCCESS");
+          if (onSuccess) onSuccess();
+          return;
+        }
+      } catch {
+        // Fall through to opening checkout below.
+      }
+
+      try {
+        // Load official Cashfree JS SDK v3.
+        if (!(window as any).Cashfree) {
+          await new Promise<void>((resolve, reject) => {
+            const script = document.createElement("script");
+            script.src = "https://sdk.cashfree.com/js/v3/cashfree.js";
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error("Unable to load payment checkout."));
+            document.body.appendChild(script);
+          });
+        }
+
+        const CashfreeSDK = (window as any).Cashfree;
+        if (typeof CashfreeSDK !== "function") {
+          throw new Error("Secure payment checkout is unavailable.");
+        }
+
+        const cashfree = new CashfreeSDK({
+          mode: orderData.cashfreeMode === "PRODUCTION" ? "production" : "sandbox",
+        });
+
+        cashfree.checkout({
+          paymentSessionId: orderData.paymentSessionId,
+          redirectTarget: "_self",
+          onCancel: () => {
+            setErrorMessage("Payment was not completed.");
+            setStep("FAILED");
+          },
+          onFailure: () => {
+            setErrorMessage("Payment could not be completed.");
+            setStep("FAILED");
+          },
+        });
+      } catch (err: any) {
+        console.error("Cashfree checkout could not be opened:", err);
+        setErrorMessage(err.message || "Unable to open secure payment checkout. Please try again.");
+        setStep("FAILED");
+      }
+      return;
+    }
+
     if (
       orderData.gateway === "SANDBOX" &&
       process.env.NODE_ENV !== "production" &&

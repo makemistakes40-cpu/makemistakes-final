@@ -33,6 +33,7 @@ import {
   Zap,
 } from "lucide-react";
 import CheckoutModal from "@/components/payment/CheckoutModal";
+import { PLANS } from "@/lib/plans";
 import { getOnboardingProfile, UserOnboardingProfile } from "@/lib/onboardingStore";
 import { getJourneyUserId } from "@/lib/journeyUser";
 
@@ -1277,9 +1278,9 @@ function SettingsContent() {
                       </div>
                       <span className="text-2xl font-bold font-mono text-zinc-900">
                         {subscriptionData?.plan === "MAX"
-                          ? "₹2,499 / mo"
+                          ? `₹${PLANS.MAX.price.toLocaleString("en-IN")} / mo`
                           : subscriptionData?.plan === "PRO"
-                          ? "₹999 / mo"
+                          ? `₹${PLANS.PRO.price.toLocaleString("en-IN")} / mo`
                           : "₹0 (Free)"}
                       </span>
                     </div>
@@ -1338,7 +1339,7 @@ function SettingsContent() {
                             <span className="text-[10px] font-mono font-bold text-teal-700 bg-teal-100 px-2 py-0.5 rounded uppercase">
                               Most Popular
                             </span>
-                            <span className="text-lg font-bold font-mono text-zinc-900">₹999 / mo</span>
+                            <span className="text-lg font-bold font-mono text-zinc-900">₹{PLANS.PRO.price.toLocaleString("en-IN")} / mo</span>
                           </div>
                           <h4 className="text-base font-serif font-bold text-zinc-900 mt-2">
                             Pro Builder Tier
@@ -1349,7 +1350,7 @@ function SettingsContent() {
                           <ul className="mt-3 space-y-1.5 text-xs text-zinc-600 font-sans">
                             <li className="flex items-center gap-1.5">
                               <CheckCircle2 className="h-3.5 w-3.5 text-teal-700 shrink-0" />
-                              <span>1,000 AI Credits / month with priority queue</span>
+                              <span>{PLANS.PRO.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month with priority queue</span>
                             </li>
                             <li className="flex items-center gap-1.5">
                               <CheckCircle2 className="h-3.5 w-3.5 text-teal-700 shrink-0" />
@@ -1374,7 +1375,7 @@ function SettingsContent() {
                               : "bg-teal-800 hover:bg-teal-700 text-white"
                           }`}
                         >
-                          {subscriptionData?.plan === "PRO" ? "Current Active Plan" : "Upgrade to Pro (₹999)"}
+                          {subscriptionData?.plan === "PRO" ? "Current Active Plan" : `Upgrade to Pro (₹${PLANS.PRO.price.toLocaleString("en-IN")})`}
                         </button>
                       </div>
 
@@ -1385,7 +1386,7 @@ function SettingsContent() {
                             <span className="text-[10px] font-mono font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded uppercase">
                               Elite Tier
                             </span>
-                            <span className="text-lg font-bold font-mono text-zinc-900">₹2,499 / mo</span>
+                            <span className="text-lg font-bold font-mono text-zinc-900">₹{PLANS.MAX.price.toLocaleString("en-IN")} / mo</span>
                           </div>
                           <h4 className="text-base font-serif font-bold text-zinc-900 mt-2">
                             Max Founder Tier
@@ -1396,7 +1397,7 @@ function SettingsContent() {
                           <ul className="mt-3 space-y-1.5 text-xs text-zinc-600 font-sans">
                             <li className="flex items-center gap-1.5">
                               <CheckCircle2 className="h-3.5 w-3.5 text-teal-700 shrink-0" />
-                              <span>5,000 AI Credits / month for intensive building</span>
+                              <span>{PLANS.MAX.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month for intensive building</span>
                             </li>
                             <li className="flex items-center gap-1.5">
                               <CheckCircle2 className="h-3.5 w-3.5 text-teal-700 shrink-0" />
@@ -1421,7 +1422,7 @@ function SettingsContent() {
                               : "bg-zinc-900 hover:bg-zinc-800 text-white"
                           }`}
                         >
-                          {subscriptionData?.plan === "MAX" ? "Current Active Plan" : "Upgrade to Max (₹2,499)"}
+                          {subscriptionData?.plan === "MAX" ? "Current Active Plan" : `Upgrade to Max (₹${PLANS.MAX.price.toLocaleString("en-IN")})`}
                         </button>
                       </div>
                     </div>

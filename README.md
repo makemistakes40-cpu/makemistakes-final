@@ -138,6 +138,7 @@ unless the deployment environment requires it.
 
 - Production OTP delivery requires a working `SMTP_USER`/`SMTP_PASS` (and optional `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_FROM`) or `RESEND_API_KEY` with `RESEND_FROM`. Ethereal previews are available only in local development.
 - Production checkout requires `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and `RAZORPAY_WEBHOOK_SECRET`. Missing gateway configuration or order creation failures stop checkout; production does not fall back to sandbox.
+- Cashfree is the preferred gateway. When `CASHFREE_APP_ID` and `CASHFREE_SECRET_KEY` are configured, order creation uses Cashfree hosted checkout instead of Razorpay. Webhooks verify their signature using `CASHFREE_SECRET_KEY` (the API Secret Key) over `x-webhook-timestamp` concatenated with the raw body; `CASHFREE_ENV` must be `PRODUCTION` (default `TEST`).
 - Local payment simulation requires both `PAYMENT_SANDBOX_ENABLED=true` and a dedicated `PAYMENT_SANDBOX_SECRET` of at least 32 bytes. Sandbox mode is rejected in production and must never be enabled in a production environment.
 - Razorpay webhook configuration must use the exact webhook signing secret configured in the Razorpay dashboard. Never reuse the JWT signing secret.
 

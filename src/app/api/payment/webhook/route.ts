@@ -7,9 +7,20 @@ export async function POST(req: Request) {
   try {
     const rawBody = await req.text();
     const signature =
+      req.headers.get("x-webhook-signature") ||
       req.headers.get("x-razorpay-signature") ||
       req.headers.get("x-signature") ||
       "";
+    const timestamp = req.headers.get("x-webhook-timestamp") || undefined;
+
+    // Identify the gateway explicitly from the header that was used to sign the
+    // webhook, so we never rely on fingerprinting the signature value alone.
+    const gateway =
+      req.headers.get("x-webhook-signature")
+        ? "CASHFREE"
+        : req.headers.get("x-razorpay-signature")
+        ? "RAZORPAY"
+        : undefined;
 
     if (!signature) {
       return NextResponse.json(
@@ -18,7 +29,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const result = await PaymentService.processWebhook({ rawBody, signature });
+    const result = await PaymentService.processWebhook({ rawBody, signature, timestamp, gateway });
     return NextResponse.json(result);
   } catch (err: unknown) {
     const code = err instanceof Error ? err.message : "";

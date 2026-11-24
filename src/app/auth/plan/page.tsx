@@ -160,7 +160,7 @@ function PlanContent() {
               </p>
             </div>
             <div className="text-right">
-              <span className="text-xl font-bold font-mono text-zinc-900">₹999</span>
+              <span className="text-xl font-bold font-mono text-zinc-900">₹{PLANS.PRO.price.toLocaleString("en-IN")}</span>
               <span className="text-[10px] font-mono text-zinc-400"> / mo</span>
             </div>
           </div>
@@ -168,7 +168,7 @@ function PlanContent() {
           <ul className="mt-3.5 space-y-1.5 text-xs text-zinc-700 font-sans">
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-teal-700 shrink-0" />
-              <span><strong>1,000 AI Credits / month</strong> for Nova mentor code review</span>
+              <span><strong>{PLANS.PRO.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month</strong> for Nova mentor code review</span>
             </li>
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-teal-700 shrink-0" />
@@ -185,7 +185,7 @@ function PlanContent() {
             className="w-full mt-4 py-3 rounded-xl bg-teal-700 hover:bg-teal-800 text-white font-semibold text-xs transition-all shadow-md shadow-teal-700/20 flex items-center justify-center gap-2 cursor-pointer"
           >
             <Lock className="w-3.5 h-3.5" />
-            <span>Select Pro Builder (₹999 / mo) &rarr;</span>
+            <span>Select Pro Builder (₹{PLANS.PRO.price.toLocaleString("en-IN")} / mo) &rarr;</span>
           </button>
         </div>
 
@@ -206,7 +206,7 @@ function PlanContent() {
               </p>
             </div>
             <div className="text-right">
-              <span className="text-xl font-bold font-mono text-zinc-900">₹2,499</span>
+              <span className="text-xl font-bold font-mono text-zinc-900">₹{PLANS.MAX.price.toLocaleString("en-IN")}</span>
               <span className="text-[10px] font-mono text-zinc-400"> / mo</span>
             </div>
           </div>
@@ -214,7 +214,7 @@ function PlanContent() {
           <ul className="mt-3 space-y-1.5 text-xs text-zinc-600 font-sans">
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-teal-700 shrink-0" />
-              <span><strong>5,000 AI Credits / month</strong> for intensive building</span>
+              <span><strong>{PLANS.MAX.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month</strong> for intensive building</span>
             </li>
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-teal-700 shrink-0" />
@@ -230,7 +230,7 @@ function PlanContent() {
             onClick={() => handleSelectPaid("MAX")}
             className="w-full mt-3.5 py-2.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-white font-semibold text-xs transition-all flex items-center justify-center gap-2 cursor-pointer"
           >
-            <span>Select Max Founder (₹2,499 / mo)</span>
+            <span>Select Max Founder (₹{PLANS.MAX.price.toLocaleString("en-IN")} / mo)</span>
             <ArrowRight className="w-3.5 h-3.5" />
           </button>
         </div>

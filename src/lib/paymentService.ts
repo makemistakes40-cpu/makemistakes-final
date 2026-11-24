@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { prisma } from "@backend/lib/prisma";
-import { getPlanConfig, PlanTier, PLANS } from "./plans";
+import { getPlanConfig, type PlanTier, PLANS } from "./plans";
 import { SessionPayload } from "./authSession";
 import {
   activateCapturedPayment,
@@ -9,6 +9,16 @@ import {
   sandboxPaymentsEnabled,
   activatePaymentOnce,
 } from "./security/paymentSecurity";
+import {
+  CashfreeClient,
+  isCashfreeConfigured,
+  getCashfreeEnv,
+  verifyCashfreeWebhookSignature,
+  resolvePaidPlan,
+  cashfreeSuccessMatchesOrder,
+  normalizeCashfreeEventType,
+  cashfreeRefundDecision,
+} from "./cashfree";
 import {
   deductCreditsAtomically,
   type CreditStore,
@@ -19,6 +29,11 @@ import {
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || "";
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "";
 const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "";
+const CASHFREE_SECRET_KEY = process.env.CASHFREE_SECRET_KEY || "";
+
+import { resolveWebhookGateway, type GatewayKind } from "./gateway";
+
+export { resolveWebhookGateway, type GatewayKind };
 
 export interface CreateOrderParams {
   session: SessionPayload;
@@ -38,6 +53,8 @@ export interface VerifyPaymentParams {
 export interface WebhookParams {
   rawBody: string;
   signature: string;
+  timestamp?: string;
+  gateway?: GatewayKind;
 }
 
 export class PaymentService {
@@ -64,7 +81,7 @@ export class PaymentService {
    * Resolves verified email from server record.
    * Determines authoritative price and currency on the server.
    */
-  public static async createOrder({ session, planId }: CreateOrderParams) {
+  public static async createOrder({ session, planId, billingName, billingPhone }: CreateOrderParams) {
     if (!session || !session.userId) {
       throw new Error("UNAUTHORIZED: Valid session required to create payment order.");
     }
@@ -91,15 +108,32 @@ export class PaymentService {
     const isRazorpayConfigured = Boolean(
       RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET && !RAZORPAY_KEY_ID.includes("your-")
     );
-    const useSandbox = !isRazorpayConfigured && sandboxPaymentsEnabled(process.env);
-    if (!isRazorpayConfigured && !useSandbox) {
-      throw new Error("PAYMENT_UNAVAILABLE: Razorpay is not configured.");
+    const useCashfree = isCashfreeConfigured(process.env);
+    const useSandbox = !useCashfree && !isRazorpayConfigured && sandboxPaymentsEnabled(process.env);
+    if (!useCashfree && !isRazorpayConfigured && !useSandbox) {
+      throw new Error("PAYMENT_UNAVAILABLE: No payment gateway is configured.");
     }
 
     let gatewayOrderId = orderId;
-    const gatewayType = useSandbox ? "SANDBOX" : "RAZORPAY";
+    let gatewayType = useCashfree ? "CASHFREE" : useSandbox ? "SANDBOX" : "RAZORPAY";
+    let cfPaymentSessionId: string | undefined;
 
-    if (isRazorpayConfigured) {
+    if (useCashfree) {
+      const cf = new CashfreeClient(process.env);
+      const cfOrder = await cf.createOrder({
+        orderId,
+        amount,
+        customer: {
+          customerId: user.id,
+          email: user.email,
+          name: user.name ?? billingName ?? undefined,
+          phone: billingPhone ?? undefined,
+        },
+        note: `MakeMistakes ${planConfig.id} plan`,
+      });
+      gatewayOrderId = cfOrder.order_id;
+      cfPaymentSessionId = cfOrder.payment_session_id;
+    } else if (isRazorpayConfigured) {
       const authHeader = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
       const rzpRes = await fetch("https://api.razorpay.com/v1/orders", {
         method: "POST",
@@ -163,6 +197,12 @@ export class PaymentService {
       userName: user.name || user.email.split("@")[0],
       gateway: gatewayType,
       keyId: isRazorpayConfigured ? RAZORPAY_KEY_ID : undefined,
+      ...(gatewayType === "CASHFREE"
+        ? {
+            paymentSessionId: cfPaymentSessionId,
+            cashfreeMode: getCashfreeEnv(),
+          }
+        : {}),
       ...(gatewayType === "SANDBOX" ? { sandboxPaymentId, sandboxSignature } : {}),
     };
   }
@@ -241,6 +281,21 @@ export class PaymentService {
         throw new Error("INVALID_SIGNATURE: Payment signature verification failed.");
       }
       return this.activateVerifiedOrder(order, gatewayPaymentId, gatewaySignature);
+    }
+
+    if (order.gateway === "CASHFREE") {
+      if (!isCashfreeConfigured(process.env)) {
+        throw new Error("PAYMENT_UNAVAILABLE: Cashfree is not configured.");
+      }
+      const cf = new CashfreeClient(process.env);
+      const payments = await cf.getOrderPayments(order.gatewayOrderId || "");
+      const captured = payments.find(
+        (p) => p.payment_status === "SUCCESS" && cashfreeSuccessMatchesOrder(p, order)
+      );
+      if (!captured) {
+        throw new Error("PAYMENT_UNVERIFIED: Cashfree has not captured a matching payment.");
+      }
+      return this.activateVerifiedOrder(order, captured.cf_payment_id, gatewaySignature);
     }
 
     if (order.gateway !== "RAZORPAY" || !order.gatewayOrderId || !RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
@@ -373,12 +428,80 @@ export class PaymentService {
   }
 
   /**
+   * Idempotently revoke a paid order on refund: mark it REFUNDED, downgrade the
+   * subscription to FREE and deduct the granted credits exactly once. Safe under
+   * duplicate/concurrent refunds because the PAID -> REFUNDED transition is a
+   * conditional update that succeeds only once.
+   */
+  private static async revokePaidOrder(order: { id: string; userId: string; orderId: string }) {
+    await prisma.$transaction(async (transaction) => {
+      const updated = await transaction.paymentOrder.updateMany({
+        where: { id: order.id, status: "PAID" },
+        data: { status: "REFUNDED" },
+      });
+      if (updated.count !== 1) return;
+      await transaction.subscription.updateMany({
+        where: { userId: order.userId, orderId: order.orderId },
+        data: { plan: "FREE", status: "REFUNDED" },
+      });
+      const [purchaseGrant, balance] = await Promise.all([
+        transaction.aiCreditTransaction.findFirst({
+          where: { userId: order.userId, referenceId: order.orderId, type: "PURCHASE_GRANT" },
+        }),
+        transaction.aiCreditBalance.findUnique({ where: { userId: order.userId } }),
+      ]);
+      const creditsToRevoke = Math.min(
+        purchaseGrant?.amount || 0,
+        balance?.remainingCredits || 0
+      );
+      let balanceAfter = balance?.remainingCredits || 0;
+      if (creditsToRevoke > 0) {
+        const balanceUpdate = await transaction.aiCreditBalance.updateMany({
+          where: {
+            userId: order.userId,
+            remainingCredits: { gte: creditsToRevoke },
+          },
+          data: { remainingCredits: { decrement: creditsToRevoke } },
+        });
+        if (balanceUpdate.count !== 1) {
+          throw new Error("REFUND_RETRY: Credit balance changed during refund processing.");
+        }
+        balanceAfter -= creditsToRevoke;
+      }
+      await transaction.aiCreditTransaction.create({
+        data: {
+          userId: order.userId,
+          amount: -creditsToRevoke,
+          type: "REFUND_DEDUCT",
+          referenceId: order.orderId,
+          balanceAfter,
+        },
+      });
+    });
+  }
+
+  /**
    * 3. WEBHOOK PROCESSOR (IDEMPOTENT)
    */
-  public static async processWebhook({ rawBody, signature }: WebhookParams) {
+  public static async processWebhook({ rawBody, signature, timestamp, gateway }: WebhookParams) {
     if (!rawBody || !signature) {
       throw new Error("Missing rawBody or signature for webhook");
     }
+
+    // Resolve the gateway explicitly from the route's header when provided;
+    // otherwise fall back to the legacy signature-format heuristic.
+    const resolvedGateway = resolveWebhookGateway(gateway, signature);
+
+    if (resolvedGateway === "CASHFREE") {
+      if (!CASHFREE_SECRET_KEY) {
+        throw new Error("PAYMENT_UNAVAILABLE: Cashfree secret key is not configured.");
+      }
+      if (!verifyCashfreeWebhookSignature(rawBody, signature, CASHFREE_SECRET_KEY, timestamp)) {
+        throw new Error("INVALID_WEBHOOK_SIGNATURE");
+      }
+      return this.processCashfreeWebhook(rawBody);
+    }
+
     if (!RAZORPAY_WEBHOOK_SECRET) {
       throw new Error("PAYMENT_UNAVAILABLE: Razorpay webhook secret is not configured.");
     }
@@ -429,50 +552,7 @@ export class PaymentService {
         });
 
         if (order && order.gateway === "RAZORPAY" && order.status === "PAID") {
-          await prisma.$transaction(async (transaction) => {
-            const updated = await transaction.paymentOrder.updateMany({
-              where: { id: order.id, status: "PAID", gatewayPaymentId },
-              data: { status: "REFUNDED" },
-            });
-            if (updated.count !== 1) return;
-            await transaction.subscription.updateMany({
-              where: { userId: order.userId, orderId: order.orderId },
-              data: { plan: "FREE", status: "REFUNDED" },
-            });
-            const [purchaseGrant, balance] = await Promise.all([
-              transaction.aiCreditTransaction.findFirst({
-                where: { userId: order.userId, referenceId: order.orderId, type: "PURCHASE_GRANT" },
-              }),
-              transaction.aiCreditBalance.findUnique({ where: { userId: order.userId } }),
-            ]);
-            const creditsToRevoke = Math.min(
-              purchaseGrant?.amount || 0,
-              balance?.remainingCredits || 0
-            );
-            let balanceAfter = balance?.remainingCredits || 0;
-            if (creditsToRevoke > 0) {
-              const balanceUpdate = await transaction.aiCreditBalance.updateMany({
-                where: {
-                  userId: order.userId,
-                  remainingCredits: { gte: creditsToRevoke },
-                },
-                data: { remainingCredits: { decrement: creditsToRevoke } },
-              });
-              if (balanceUpdate.count !== 1) {
-                throw new Error("REFUND_RETRY: Credit balance changed during refund processing.");
-              }
-              balanceAfter -= creditsToRevoke;
-            }
-            await transaction.aiCreditTransaction.create({
-              data: {
-                userId: order.userId,
-                amount: -creditsToRevoke,
-                type: "REFUND_DEDUCT",
-                referenceId: order.orderId,
-                balanceAfter,
-              },
-            });
-          });
+          await this.revokePaidOrder(order);
         }
       }
 
@@ -480,6 +560,88 @@ export class PaymentService {
     }
 
     return { success: true, message: `Ignored unhandled event: ${eventType}` };
+  }
+
+  /**
+   * Cashfree webhook processor. Cashfree sends events named with a
+   * "_WEBHOOK" suffix (PAYMENT_SUCCESS_WEBHOOK, PAYMENT_FAILED_WEBHOOK,
+   * PAYMENT_USER_DROPPED_WEBHOOK, REFUND_STATUS_WEBHOOK) as well as the
+   * legacy unsuffixed forms (PAYMENT_SUCCESS, PAYMENT_FAILED,
+   * PAYMENT_CANCELLED, REFUND_SUCCESS). The payload is { event_time, type,
+   * data: { order, payment, refund }, ... }. normalizeCashfreeEventType maps
+   * both to the same canonical names below. We only activate on success; we
+   * have already verified the signature at the call site.
+   */
+  private static async processCashfreeWebhook(rawBody: string) {
+    const event = JSON.parse(rawBody);
+    const eventType = normalizeCashfreeEventType(event.type || event.event || "");
+    const orderRef = event.data?.order || event.order || {};
+    const orderId = orderRef.order_id;
+    const payment = event.data?.payment || event.payment || {};
+    const paymentId = payment.cf_payment_id;
+
+    if (!orderId) {
+      return { success: true, message: "Order id missing; ignoring" };
+    }
+
+    const order = await prisma.paymentOrder.findFirst({
+      where: { gatewayOrderId: orderId },
+    });
+
+    if (!order) {
+      return { success: true, message: "Order not found in database" };
+    }
+    if (order.gateway !== "CASHFREE") {
+      throw new Error("INVALID_WEBHOOK: Payment does not match the stored order.");
+    }
+
+    if (eventType === "PAYMENT_SUCCESS") {
+      // Idempotency: already PAID orders are ignored for success events.
+      if (order.status === "PAID") {
+        return { success: true, message: "Payment already processed; ignoring duplicate" };
+      }
+      if (!paymentId) {
+        throw new Error("INVALID_WEBHOOK: Successful payment is missing a payment id.");
+      }
+      // Validate the reported amount and currency match the stored order before
+      // activating. Prevents activating an order whose webhook amount was
+      // tampered with (or a wrong-plan/gateway payload).
+      if (!cashfreeSuccessMatchesOrder(payment, order)) {
+        throw new Error(
+          "INVALID_WEBHOOK: Success webhook amount/currency does not match the order."
+        );
+      }
+      return this.activateVerifiedOrder(order, paymentId);
+    }
+
+    // Refund delivered: revoke credits exactly once (idempotent). Confirm the
+    // refund references this order's actual payment and a matching amount so a
+    // refund for a different order/payment cannot revoke this one.
+    if (eventType === "REFUND_STATUS" || eventType === "REFUND_SUCCESS") {
+      const refund = event.data?.refund || event.refund || {};
+      const decision = cashfreeRefundDecision({ eventType, refund, order });
+      if (!decision.revoke) {
+        return { success: true, message: `Ignored refund event (${decision.reason})` };
+      }
+      await this.revokePaidOrder(order);
+      return { success: true, message: "Refund processed and access updated" };
+    }
+
+    if (
+      eventType === "PAYMENT_FAILED" ||
+      eventType === "PAYMENT_CANCELLED" ||
+      eventType === "PAYMENT_USER_DROPPED"
+    ) {
+      if (order.status === "CREATED") {
+        await prisma.paymentOrder.updateMany({
+          where: { id: order.id, status: "CREATED" },
+          data: { status: "FAILED" },
+        });
+      }
+      return { success: true, message: "Failed/cancelled payment recorded" };
+    }
+
+    return { success: true, message: `Ignored unhandled Cashfree event: ${eventType}` };
   }
 
   /**

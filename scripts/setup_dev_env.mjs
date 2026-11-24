@@ -7,15 +7,18 @@
  * It never touches committed `.env*` files or contacts a database.
  *
  * Usage:
- *   node scripts/setup_dev_env.mjs
+ *   node scripts/setup_dev_env.mjs                      # loopback dev DB only
+ *   node scripts/setup_dev_env.mjs --allow-cloud-dev    # allow Atlas dev DB
  *
  * Optional overrides via environment:
  *   DEV_DATABASE_URL=mongodb://127.0.0.1:27017/makemistakes_dev
+ *   DEV_DATABASE_URL=mongodb+srv://dev:<pass>@dev-cluster.mongodb.net/makemistakes_dev
  *   DEV_SESSION_SECRET=<64 hex chars>   (otherwise generated)
  */
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { assertDevDatabaseUrlAllowed } from "./lib/devDatabaseUrl.mjs";
 
 const ROOT = process.cwd();
 const TARGET = path.join(ROOT, ".env.local");
@@ -23,23 +26,8 @@ const TARGET = path.join(ROOT, ".env.local");
 const DEFAULT_DATABASE_URL =
   "mongodb://127.0.0.1:27017/makemistakes_dev?directConnection=true&serverSelectionTimeoutMS=5000";
 
-function validateDevDatabaseUrl(value) {
-  let url;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error("Development DATABASE_URL must be a valid MongoDB URI.");
-  }
-  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const database = url.pathname.replace(/^\//, "").split(/[?&#]/)[0];
-  if (
-    !["mongodb:", "mongodb+srv:"].includes(url.protocol) ||
-    !["localhost", "127.0.0.1", "::1"].includes(host) ||
-    database !== "makemistakes_dev"
-  ) {
-    throw new Error("Only the local MongoDB database 'makemistakes_dev' is allowed for development setup.");
-  }
-  return { host, database };
+function validateDevDatabaseUrl(value, allowCloud = false) {
+  return assertDevDatabaseUrlAllowed(value, { allowCloud });
 }
 
 function randomSecret() {
@@ -93,6 +81,7 @@ function main() {
   if (process.env.NODE_ENV === "production") {
     throw new Error("Refusing to prepare a local development environment from a production process.");
   }
+  const allowCloud = process.argv.includes("--allow-cloud-dev");
   const existing = loadExisting();
   const parsed = parseEnvLines(existing);
   if (parsed.NODE_ENV && parsed.NODE_ENV !== "development") {
@@ -110,7 +99,7 @@ function main() {
   }
 
   const databaseUrl = parsed.DATABASE_URL || process.env.DEV_DATABASE_URL || DEFAULT_DATABASE_URL;
-  const databaseIdentity = validateDevDatabaseUrl(databaseUrl);
+  const databaseIdentity = validateDevDatabaseUrl(databaseUrl, allowCloud);
 
   const next = renderLines({
     DATABASE_URL: databaseUrl,

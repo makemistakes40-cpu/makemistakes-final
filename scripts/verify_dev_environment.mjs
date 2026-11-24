@@ -6,7 +6,8 @@
  * Checks:
  *   1. `.env.local` override is present and DATABASE_URL is set.
  *   2. DATABASE_URL targets a development/local database (refuses non-dev URLs
- *      unless --force is given), so we never probe the production database.
+ *      unless --allow-cloud-dev is given for an Atlas makemistakes_dev SRV URL),
+ *      so we never probe the production database.
  *   3. The dev MongoDB is reachable, readable, and writable (probe document is
  *      written to a throwaway collection and removed afterwards).
  *   4. A development-only session secret (JWT_ACCESS_SECRET, >= 32 bytes) is in
@@ -14,16 +15,23 @@
  *
  * Usage:
  *   node scripts/verify_dev_environment.mjs
- *   node scripts/verify_dev_environment.mjs --force   # bypass non-dev URL guard
+ *   node scripts/verify_dev_environment.mjs --allow-cloud-dev  # allow Atlas dev DB
+ *
+ * The Atlas/loopback safety rules mirror scripts/setup_dev_env.mjs:
+ *   - loopback hosts (localhost/127.0.0.1/::1) are accepted by default;
+ *   - MongoDB Atlas SRV URLs are accepted only with --allow-cloud-dev AND the
+ *     database name exactly 'makemistakes_dev';
+ *   - production database names and non-Atlas cloud URLs are always rejected.
  *
  * Exits 0 on success, non-zero on any failure.
  */
 import fs from "node:fs";
 import path from "node:path";
 import { MongoClient } from "mongodb";
+import { classifyDevDatabaseUrl } from "./lib/devDatabaseUrl.mjs";
 
 const ROOT = process.cwd();
-const FORCE = process.argv.includes("--force");
+const ALLOW_CLOUD_DEV = process.argv.includes("--allow-cloud-dev");
 
 function loadLocalEnv() {
   for (const name of [".env.local", ".env.development.local", ".env"]) {
@@ -49,32 +57,7 @@ function loadLocalEnv() {
 }
 
 function classifyDb(url) {
-  let u;
-  try {
-    u = new URL(url);
-  } catch {
-    return { devMode: false, host: "", dbName: "", cloud: false, localHost: false, reason: "invalid-url" };
-  }
-  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const dbName = (u.pathname || "").replace(/^\//, "").split(/[?&#]/)[0];
-  const localHost = host === "localhost" || host === "127.0.0.1" || host === "::1";
-  const cloud = /mongodb\.net/i.test(host) || /atlas/i.test(host);
-  const devName = /(dev|test|local|staging|sandbox|isolated)/i.test(dbName);
-  let devMode = false;
-  let reason = "";
-  if (localHost) {
-    devMode = true;
-    reason = "local-host";
-  } else if (cloud) {
-    devMode = devName && FORCE;
-    reason = "cloud" + (devName ? "+dev-name" : "+non-dev-name");
-  } else if (devName) {
-    devMode = true;
-    reason = "dev-name";
-  } else {
-    reason = "unknown/non-dev";
-  }
-  return { devMode, host, dbName, cloud, localHost, reason };
+  return classifyDevDatabaseUrl(url, { allowCloud: ALLOW_CLOUD_DEV });
 }
 
 function fail(msg) {
@@ -112,7 +95,8 @@ console.log("  Target database:", info.host || "(none)", "/", info.dbName || "(n
 if (!info.devMode) {
   fail(
     "Refusing to verify: DATABASE_URL does not point at a development/local database. " +
-      "If you are sure this is a safe dev database, re-run with --force."
+      "Atlas development URLs require the --allow-cloud-dev flag and the " +
+      "'makemistakes_dev' database name (loopback hosts are always allowed)."
   );
   process.exit(1);
 }

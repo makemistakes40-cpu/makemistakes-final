@@ -64,7 +64,7 @@ async function main() {
   // Test 1: User A purchases Pro and receives the correct entitlement
   await runTest(1, "User A purchases Pro and receives correct entitlement", async () => {
     orderA = await PaymentService.createOrder({ session: sessionA, planId: "PRO" });
-    if (!orderA.orderId || orderA.plan !== "PRO" || orderA.amount !== 99900) {
+    if (!orderA.orderId || orderA.plan !== "PRO" || orderA.amount !== 349900) {
       throw new Error("Order creation returned invalid amount or plan");
     }
 
@@ -386,7 +386,7 @@ async function main() {
       throw new Error("Payment history was empty for User A");
     }
     const record = sub.orders.find((o: any) => o.orderId === orderA.orderId);
-    if (!record || record.status !== "PAID" || record.amount !== 99900) {
+    if (!record || record.status !== "PAID" || record.amount !== 349900) {
       throw new Error("Payment order history record missing or has incorrect amount/status");
     }
   });
