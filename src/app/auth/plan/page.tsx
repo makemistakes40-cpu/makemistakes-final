@@ -74,7 +74,7 @@ function PlanContent() {
     router.push(dest);
   };
 
-  const handleSelectPaid = (tier: "PRO" | "MAX") => {
+  const handleSelectPaid = (tier: "BUILDER" | "PRO") => {
     setSelectedPlan(tier);
     setCheckoutOpen(true);
   };
@@ -144,7 +144,7 @@ function PlanContent() {
 
       {/* Plan Options Stack */}
       <div className="space-y-3.5 pt-1">
-        {/* 1. PRO BUILDER TIER (RECOMMENDED) */}
+        {/* 1. BUILDER TIER (RECOMMENDED) */}
         <div className="relative p-5 rounded-2xl border-2 border-teal-600 bg-teal-50/40 shadow-sm hover:border-teal-700 transition-all">
           <div className="absolute -top-2.5 right-4 px-2.5 py-0.5 rounded-full bg-teal-700 text-white font-mono text-[9px] font-bold uppercase tracking-wider shadow-sm">
             RECOMMENDED
@@ -153,22 +153,22 @@ function PlanContent() {
           <div className="flex items-baseline justify-between">
             <div>
               <h3 className="text-base font-serif font-bold text-zinc-900">
-                Pro Builder Tier
+                Builder Tier
               </h3>
               <p className="text-xs text-zinc-500 font-sans">
                 Full Socratic mentor reviews & verified portfolio.
               </p>
             </div>
             <div className="text-right">
-              <span className="text-xl font-bold font-mono text-zinc-900">₹{PLANS.PRO.price.toLocaleString("en-IN")}</span>
-              <span className="text-[10px] font-mono text-zinc-400"> / mo</span>
+              <span className="text-xl font-bold font-mono text-zinc-900">₹{PLANS.BUILDER.price.toLocaleString("en-IN")}</span>
+              <span className="text-[10px] font-mono text-zinc-400"> / 30 days</span>
             </div>
           </div>
 
           <ul className="mt-3.5 space-y-1.5 text-xs text-zinc-700 font-sans">
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-teal-700 shrink-0" />
-              <span><strong>{PLANS.PRO.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month</strong> for Nova mentor code review</span>
+              <span><strong>{PLANS.BUILDER.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month</strong> for Nova mentor code review</span>
             </li>
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-teal-700 shrink-0" />
@@ -181,21 +181,21 @@ function PlanContent() {
           </ul>
 
           <button
-            onClick={() => handleSelectPaid("PRO")}
+            onClick={() => handleSelectPaid("BUILDER")}
             className="w-full mt-4 py-3 rounded-xl bg-teal-700 hover:bg-teal-800 text-white font-semibold text-xs transition-all shadow-md shadow-teal-700/20 flex items-center justify-center gap-2 cursor-pointer"
           >
             <Lock className="w-3.5 h-3.5" />
-            <span>Select Pro Builder (₹{PLANS.PRO.price.toLocaleString("en-IN")} / mo) &rarr;</span>
+            <span>Select Builder (₹{PLANS.BUILDER.price.toLocaleString("en-IN")} / 30 days) &rarr;</span>
           </button>
         </div>
 
-        {/* 2. MAX FOUNDER TIER */}
+        {/* 2. PRO TIER */}
         <div className="p-4 sm:p-5 rounded-2xl border border-zinc-200 bg-white hover:border-zinc-300 transition-all">
           <div className="flex items-baseline justify-between">
             <div>
               <div className="flex items-center gap-2">
                 <h3 className="text-base font-serif font-bold text-zinc-900">
-                  Max Founder Tier
+                  Pro Tier
                 </h3>
                 <span className="text-[9px] font-mono font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded uppercase">
                   Elite
@@ -206,15 +206,15 @@ function PlanContent() {
               </p>
             </div>
             <div className="text-right">
-              <span className="text-xl font-bold font-mono text-zinc-900">₹{PLANS.MAX.price.toLocaleString("en-IN")}</span>
-              <span className="text-[10px] font-mono text-zinc-400"> / mo</span>
+              <span className="text-xl font-bold font-mono text-zinc-900">₹{PLANS.PRO.price.toLocaleString("en-IN")}</span>
+              <span className="text-[10px] font-mono text-zinc-400"> / 4 mo</span>
             </div>
           </div>
 
           <ul className="mt-3 space-y-1.5 text-xs text-zinc-600 font-sans">
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-teal-700 shrink-0" />
-              <span><strong>{PLANS.MAX.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month</strong> for intensive building</span>
+              <span><strong>{PLANS.PRO.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month</strong> for intensive building</span>
             </li>
             <li className="flex items-center gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-teal-700 shrink-0" />
@@ -227,10 +227,10 @@ function PlanContent() {
           </ul>
 
           <button
-            onClick={() => handleSelectPaid("MAX")}
+            onClick={() => handleSelectPaid("PRO")}
             className="w-full mt-3.5 py-2.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-white font-semibold text-xs transition-all flex items-center justify-center gap-2 cursor-pointer"
           >
-            <span>Select Max Founder (₹{PLANS.MAX.price.toLocaleString("en-IN")} / mo)</span>
+            <span>Select Pro (₹{PLANS.PRO.price.toLocaleString("en-IN")} / 4 months)</span>
             <ArrowRight className="w-3.5 h-3.5" />
           </button>
         </div>

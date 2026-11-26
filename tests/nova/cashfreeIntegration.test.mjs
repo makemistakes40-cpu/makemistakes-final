@@ -400,3 +400,201 @@ test("refund decision: legacy REFUND_SUCCESS still revokes on valid payload", ()
     { revoke: true }
   );
 });
+
+test("createOrder: Cashfree is the only new-order gateway; no Razorpay fallback", async () => {
+  const { PaymentService } = await import("../../src/lib/paymentService.ts");
+
+  // Set up a user in the mocked Prisma store.
+  globalThis.__novaPrismaMock = {
+    user: {
+      findUnique: async () => ({ id: "u1", email: "a@b.com", name: "A" }),
+    },
+  };
+
+  const envKeys = [
+    "CASHFREE_APP_ID",
+    "CASHFREE_SECRET_KEY",
+    "PAYMENT_SANDBOX_ENABLED",
+    "NODE_ENV",
+    "RAZORPAY_KEY_ID",
+    "RAZORPAY_KEY_SECRET",
+  ];
+  const savedEnv = {};
+  for (const k of envKeys) savedEnv[k] = process.env[k];
+
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error("fetch must not be called when no gateway is configured");
+  };
+
+  try {
+    // Cashfree NOT configured, sandbox disabled, but Razorpay creds ARE present:
+    // new orders must fail closed instead of falling back to Razorpay.
+    delete process.env.CASHFREE_APP_ID;
+    delete process.env.CASHFREE_SECRET_KEY;
+    process.env.PAYMENT_SANDBOX_ENABLED = "false";
+    process.env.NODE_ENV = "test";
+    process.env.RAZORPAY_KEY_ID = "rzp_test_key";
+    process.env.RAZORPAY_KEY_SECRET = "rzp_test_secret";
+
+    await assert.rejects(
+      () => PaymentService.createOrder({ session: { userId: "u1" }, planId: "PRO" }),
+      /PAYMENT_UNAVAILABLE/
+    );
+    assert.equal(fetchCalls, 0, "must not attempt any gateway order creation");
+  } finally {
+    for (const k of envKeys) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    globalThis.fetch = originalFetch;
+    delete globalThis.__novaPrismaMock;
+  }
+});
+
+// --- final pricing structure (confirmed production decision) --------------
+
+test("final plans: FREE ₹0 lifetime, BUILDER ₹499/30 days, PRO ₹1,499/4 months", () => {
+  const free = getPlanConfig("FREE");
+  const builder = getPlanConfig("BUILDER");
+  const pro = getPlanConfig("PRO");
+  const max = getPlanConfig("MAX");
+
+  // FREE TRIAL
+  assert.equal(free.id, "FREE");
+  assert.equal(free.price, 0);
+  assert.equal(free.amountInPaise, 0);
+  assert.equal(free.billingPeriod, "lifetime");
+  assert.equal(free.dailyAllocation, 25);
+  assert.equal(free.aiCreditsPerMonth, 750);
+
+  // BUILDER: ₹499, 30 days, 950/28,500 credits
+  assert.equal(builder.id, "BUILDER");
+  assert.equal(builder.price, 499);
+  assert.equal(builder.amountInPaise, 49900);
+  assert.equal(builder.billingPeriod, "30 days");
+  assert.equal(builder.dailyAllocation, 950);
+  assert.equal(builder.aiCreditsPerMonth, 28500);
+
+  // PRO (renamed from Max Founder): ₹1,499, 4 calendar months, 1,900/57,000
+  assert.equal(pro.id, "PRO");
+  assert.equal(pro.price, 1499);
+  assert.equal(pro.amountInPaise, 149900);
+  assert.equal(pro.billingPeriod, "4 months");
+  assert.equal(pro.accessMonths, 4);
+  assert.equal(pro.dailyAllocation, 1900);
+  assert.equal(pro.aiCreditsPerMonth, 57000);
+
+  // Historical MAX remains a recognized legacy alias with Pro-level entitlements.
+  assert.equal(max.id, "MAX");
+  assert.equal(max.price, 1499);
+  assert.equal(max.amountInPaise, 149900);
+  assert.equal(max.accessMonths, 4);
+});
+
+test("createOrder rejects legacy MAX for new purchases", async () => {
+  const { PaymentService } = await import("../../src/lib/paymentService.ts");
+  globalThis.__novaPrismaMock = {
+    user: { findUnique: async () => ({ id: "u1", email: "a@b.com", name: "A" }) },
+  };
+  try {
+    await assert.rejects(
+      () => PaymentService.createOrder({ session: { userId: "u1" }, planId: "MAX" }),
+      /INVALID_PLAN/
+    );
+  } finally {
+    delete globalThis.__novaPrismaMock;
+  }
+});
+
+test("createOrder uses server-authoritative PRO amount (₹1,499 = 149,900 paise)", async () => {
+  const { PaymentService } = await import("../../src/lib/paymentService.ts");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      order_id: "cf_order_pro_1",
+      payment_session_id: "session_pro_1",
+      order_status: "ACTIVE",
+    }),
+  });
+  globalThis.__novaPrismaMock = {
+    user: { findUnique: async () => ({ id: "u1", email: "a@b.com", name: "A" }) },
+    paymentOrder: {
+      create: async (args) => ({
+        orderId: "ord_mm_test",
+        amount: args.data.amount,
+        currency: args.data.currency,
+        plan: args.data.plan,
+        gateway: args.data.gateway,
+        gatewayOrderId: args.data.gatewayOrderId,
+      }),
+    },
+  };
+  try {
+    process.env.CASHFREE_APP_ID = "app";
+    process.env.CASHFREE_SECRET_KEY = "secret";
+    process.env.CASHFREE_ENV = "TEST";
+    const order = await PaymentService.createOrder({
+      session: { userId: "u1" },
+      planId: "PRO",
+    });
+    assert.equal(order.plan, "PRO");
+    assert.equal(order.amount, 149900);
+    assert.equal(order.currency, "INR");
+    assert.equal(order.gateway, "CASHFREE");
+  } finally {
+    for (const k of ["CASHFREE_APP_ID", "CASHFREE_SECRET_KEY", "CASHFREE_ENV"]) {
+      delete process.env[k];
+    }
+    globalThis.fetch = originalFetch;
+    delete globalThis.__novaPrismaMock;
+  }
+});
+
+test("createOrder uses server-authoritative BUILDER amount (₹499 = 49,900 paise)", async () => {
+  const { PaymentService } = await import("../../src/lib/paymentService.ts");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      order_id: "cf_order_bld_1",
+      payment_session_id: "session_bld_1",
+      order_status: "ACTIVE",
+    }),
+  });
+  globalThis.__novaPrismaMock = {
+    user: { findUnique: async () => ({ id: "u1", email: "a@b.com", name: "A" }) },
+    paymentOrder: {
+      create: async (args) => ({
+        orderId: "ord_mm_test",
+        amount: args.data.amount,
+        currency: args.data.currency,
+        plan: args.data.plan,
+        gateway: args.data.gateway,
+        gatewayOrderId: args.data.gatewayOrderId,
+      }),
+    },
+  };
+  try {
+    process.env.CASHFREE_APP_ID = "app";
+    process.env.CASHFREE_SECRET_KEY = "secret";
+    process.env.CASHFREE_ENV = "TEST";
+    const order = await PaymentService.createOrder({
+      session: { userId: "u1" },
+      planId: "BUILDER",
+    });
+    assert.equal(order.plan, "BUILDER");
+    assert.equal(order.amount, 49900);
+    assert.equal(order.currency, "INR");
+    assert.equal(order.gateway, "CASHFREE");
+  } finally {
+    for (const k of ["CASHFREE_APP_ID", "CASHFREE_SECRET_KEY", "CASHFREE_ENV"]) {
+      delete process.env[k];
+    }
+    globalThis.fetch = originalFetch;
+    delete globalThis.__novaPrismaMock;
+  }
+});

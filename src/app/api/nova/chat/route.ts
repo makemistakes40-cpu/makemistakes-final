@@ -569,8 +569,16 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1. Resolve user subscription tier from trusted server-side wallet
-    const wallet = await reconcileAndGetWallet(db, userId);
+    // 1. Resolve the authoritative subscription from server-side account state and map it
+    //    into the Nova wallet contract. Never trust the stored MongoDB tier alone, which can
+    //    go stale after expiry/cancellation/refund.
+    const accountSub = await PaymentService.getAccountSubscription(session.userId);
+    const userSubscription = {
+      plan: accountSub.plan,
+      status: accountSub.status,
+      expiryDate: accountSub.expiryDate ?? null,
+    };
+    const wallet = await reconcileAndGetWallet(db, userId, userSubscription);
     const userTier = wallet.tier;
     const estimatedCredits = userTier === "FREE" ? 2 : 5;
 
@@ -580,6 +588,7 @@ export async function POST(req: Request) {
       conversationId: conversation.conversationId,
       problemId,
       estimatedCredits,
+      userSubscription,
     });
 
     if (!reserveResult.success) {

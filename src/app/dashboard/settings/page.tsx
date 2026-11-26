@@ -130,7 +130,7 @@ function SettingsContent() {
   const [deleteStatus, setDeleteStatus] = useState<"idle" | "deleting" | "error">("idle");
   const [upgradeNotice, setUpgradeNotice] = useState(false);
   const [subscriptionData, setSubscriptionData] = useState<any>(null);
-  const [checkoutPlan, setCheckoutPlan] = useState<"PRO" | "MAX">("PRO");
+  const [checkoutPlan, setCheckoutPlan] = useState<"PRO" | "BUILDER">("PRO");
   const [showCheckoutModal, setShowCheckoutModal] = useState(false);
   const [githubConnected, setGithubConnected] = useState(false);
   const [githubUsername, setGithubUsername] = useState("");
@@ -1269,18 +1269,14 @@ function SettingsContent() {
                           Current Plan
                         </span>
                         <h3 className="text-xl font-serif font-bold text-zinc-900 mt-1">
-                          {subscriptionData?.plan === "MAX"
-                            ? "Max Founder Tier"
-                            : subscriptionData?.plan === "PRO"
-                            ? "Pro Builder Tier"
+                          {subscriptionData?.plan === "PRO" || subscriptionData?.plan === "MAX"
+                            ? "Pro Tier"
                             : "Free Community Tier"}
                         </h3>
                       </div>
                       <span className="text-2xl font-bold font-mono text-zinc-900">
-                        {subscriptionData?.plan === "MAX"
-                          ? `₹${PLANS.MAX.price.toLocaleString("en-IN")} / mo`
-                          : subscriptionData?.plan === "PRO"
-                          ? `₹${PLANS.PRO.price.toLocaleString("en-IN")} / mo`
+                        {subscriptionData?.plan === "PRO" || subscriptionData?.plan === "MAX"
+                          ? `₹${PLANS.PRO.price.toLocaleString("en-IN")} / 4 mo`
                           : "₹0 (Free)"}
                       </span>
                     </div>
@@ -1332,17 +1328,17 @@ function SettingsContent() {
                     </h3>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      {/* PRO BUILDER */}
+                      {/* BUILDER */}
                       <div className="p-5 rounded-2xl border border-zinc-200 bg-zinc-50 flex flex-col justify-between space-y-4">
                         <div>
                           <div className="flex items-center justify-between">
                             <span className="text-[10px] font-mono font-bold text-teal-700 bg-teal-100 px-2 py-0.5 rounded uppercase">
                               Most Popular
                             </span>
-                            <span className="text-lg font-bold font-mono text-zinc-900">₹{PLANS.PRO.price.toLocaleString("en-IN")} / mo</span>
+                            <span className="text-lg font-bold font-mono text-zinc-900">₹{PLANS.BUILDER.price.toLocaleString("en-IN")} / 30 days</span>
                           </div>
                           <h4 className="text-base font-serif font-bold text-zinc-900 mt-2">
-                            Pro Builder Tier
+                            Builder Tier
                           </h4>
                           <p className="text-xs text-zinc-500 mt-1">
                             For serious student engineers aiming for top startup roles.
@@ -1350,7 +1346,7 @@ function SettingsContent() {
                           <ul className="mt-3 space-y-1.5 text-xs text-zinc-600 font-sans">
                             <li className="flex items-center gap-1.5">
                               <CheckCircle2 className="h-3.5 w-3.5 text-teal-700 shrink-0" />
-                              <span>{PLANS.PRO.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month with priority queue</span>
+                              <span>{PLANS.BUILDER.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month with priority queue</span>
                             </li>
                             <li className="flex items-center gap-1.5">
                               <CheckCircle2 className="h-3.5 w-3.5 text-teal-700 shrink-0" />
@@ -1365,31 +1361,31 @@ function SettingsContent() {
 
                         <button
                           onClick={() => {
-                            setCheckoutPlan("PRO");
+                            setCheckoutPlan("BUILDER");
                             setShowCheckoutModal(true);
                           }}
-                          disabled={subscriptionData?.plan === "PRO"}
+                          disabled={subscriptionData?.plan === "BUILDER"}
                           className={`w-full py-2.5 rounded-xl font-semibold text-xs transition-all cursor-pointer ${
-                            subscriptionData?.plan === "PRO"
+                            subscriptionData?.plan === "BUILDER"
                               ? "bg-zinc-200 text-zinc-500 cursor-default"
                               : "bg-teal-800 hover:bg-teal-700 text-white"
                           }`}
                         >
-                          {subscriptionData?.plan === "PRO" ? "Current Active Plan" : `Upgrade to Pro (₹${PLANS.PRO.price.toLocaleString("en-IN")})`}
+                          {subscriptionData?.plan === "BUILDER" ? "Current Active Plan" : `Upgrade to Builder (₹${PLANS.BUILDER.price.toLocaleString("en-IN")})`}
                         </button>
                       </div>
 
-                      {/* MAX FOUNDER */}
+                      {/* PRO */}
                       <div className="p-5 rounded-2xl border border-zinc-200 bg-zinc-50 flex flex-col justify-between space-y-4">
                         <div>
                           <div className="flex items-center justify-between">
                             <span className="text-[10px] font-mono font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded uppercase">
                               Elite Tier
                             </span>
-                            <span className="text-lg font-bold font-mono text-zinc-900">₹{PLANS.MAX.price.toLocaleString("en-IN")} / mo</span>
+                            <span className="text-lg font-bold font-mono text-zinc-900">₹{PLANS.PRO.price.toLocaleString("en-IN")} / 4 mo</span>
                           </div>
                           <h4 className="text-base font-serif font-bold text-zinc-900 mt-2">
-                            Max Founder Tier
+                            Pro Tier
                           </h4>
                           <p className="text-xs text-zinc-500 mt-1">
                             Full unconstrained power for founders and senior engineering candidates.
@@ -1397,7 +1393,7 @@ function SettingsContent() {
                           <ul className="mt-3 space-y-1.5 text-xs text-zinc-600 font-sans">
                             <li className="flex items-center gap-1.5">
                               <CheckCircle2 className="h-3.5 w-3.5 text-teal-700 shrink-0" />
-                              <span>{PLANS.MAX.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month for intensive building</span>
+                              <span>{PLANS.PRO.aiCreditsPerMonth.toLocaleString("en-IN")} AI Credits / month for intensive building</span>
                             </li>
                             <li className="flex items-center gap-1.5">
                               <CheckCircle2 className="h-3.5 w-3.5 text-teal-700 shrink-0" />
@@ -1412,17 +1408,17 @@ function SettingsContent() {
 
                         <button
                           onClick={() => {
-                            setCheckoutPlan("MAX");
+                            setCheckoutPlan("PRO");
                             setShowCheckoutModal(true);
                           }}
-                          disabled={subscriptionData?.plan === "MAX"}
+                          disabled={subscriptionData?.plan === "PRO" || subscriptionData?.plan === "MAX"}
                           className={`w-full py-2.5 rounded-xl font-semibold text-xs transition-all cursor-pointer ${
-                            subscriptionData?.plan === "MAX"
+                            subscriptionData?.plan === "PRO" || subscriptionData?.plan === "MAX"
                               ? "bg-zinc-200 text-zinc-500 cursor-default"
                               : "bg-zinc-900 hover:bg-zinc-800 text-white"
                           }`}
                         >
-                          {subscriptionData?.plan === "MAX" ? "Current Active Plan" : `Upgrade to Max (₹${PLANS.MAX.price.toLocaleString("en-IN")})`}
+                          {subscriptionData?.plan === "PRO" || subscriptionData?.plan === "MAX" ? "Current Active Plan" : `Upgrade to Pro (₹${PLANS.PRO.price.toLocaleString("en-IN")})`}
                         </button>
                       </div>
                     </div>

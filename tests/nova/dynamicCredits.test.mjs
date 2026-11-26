@@ -2281,3 +2281,89 @@ test("Audit E: isCurrentCycle distinguishes legacy reservations by their created
   assert.equal(explicitOld, false);
 });
 
+// -------------------------------------------------------------
+// Subscription -> Nova wallet entitlement mapping (audit Fix 1 / Fix 3)
+// -------------------------------------------------------------
+test("Free user receives Free allocation", async () => {
+  const db = new DynamicFakeDb();
+  const w = await reconcileAndGetWallet(db, "s-ent-free", { plan: "FREE" });
+  assert.equal(w.tier, "FREE");
+  assert.equal(w.dailyAllowance, 25);
+  assert.equal(w.monthlyCeiling, 750);
+});
+
+test("Active Builder receives 950 daily / 28,500 monthly credits", async () => {
+  const db = new DynamicFakeDb();
+  const w = await reconcileAndGetWallet(db, "s-ent-builder", {
+    plan: "BUILDER",
+    status: "ACTIVE",
+    expiryDate: new Date(Date.now() + 86400000 * 30),
+  });
+  assert.equal(w.tier, "BUILDER");
+  assert.equal(w.dailyAllowance, 950);
+  assert.equal(w.monthlyCeiling, 28500);
+});
+
+test("Active Pro receives 1,900 daily / 57,000 monthly credits", async () => {
+  const db = new DynamicFakeDb();
+  const w = await reconcileAndGetWallet(db, "s-ent-pro", {
+    plan: "PRO",
+    status: "ACTIVE",
+    expiryDate: new Date(Date.now() + 86400000 * 30),
+  });
+  assert.equal(w.tier, "PRO");
+  assert.equal(w.dailyAllowance, 1900);
+  assert.equal(w.monthlyCeiling, 57000);
+});
+
+test("Active Max receives Pro-level Nova entitlements", async () => {
+  const db = new DynamicFakeDb();
+  const w = await reconcileAndGetWallet(db, "s-ent-max", {
+    plan: "MAX",
+    status: "ACTIVE",
+    expiryDate: new Date(Date.now() + 86400000 * 90),
+  });
+  assert.equal(w.tier, "PRO"); // MAX maps to Pro tier
+  assert.equal(w.dailyAllowance, 1900);
+  assert.equal(w.monthlyCeiling, 57000);
+});
+
+test("Expired Pro subscription downgrades wallet to Free even with stale paid tier", async () => {
+  const db = new DynamicFakeDb();
+  // First establish a paid wallet (stale stored tier).
+  await reconcileAndGetWallet(db, "s-ent-expired", {
+    plan: "PRO",
+    status: "ACTIVE",
+    expiryDate: new Date(Date.now() + 86400000 * 30),
+  });
+  // Authoritative subscription is now expired -> must downgrade to FREE.
+  const w = await reconcileAndGetWallet(db, "s-ent-expired", {
+    plan: "PRO",
+    status: "EXPIRED",
+    expiryDate: new Date(Date.now() - 1000),
+  });
+  assert.equal(w.tier, "FREE");
+  assert.equal(w.isPaidActive, false);
+  assert.equal(w.dailyAllowance, 25);
+  assert.equal(w.monthlyCeiling, 750);
+});
+
+test("Cancelled/refunded subscriptions cannot retain paid entitlements", async () => {
+  for (const status of ["CANCELLED", "REFUNDED", "FAILED"]) {
+    const db = new DynamicFakeDb();
+    await reconcileAndGetWallet(db, "s-ent-cancelled", {
+      plan: "PRO",
+      status: "ACTIVE",
+      expiryDate: new Date(Date.now() + 86400000 * 30),
+    });
+    const w = await reconcileAndGetWallet(db, "s-ent-cancelled", {
+      plan: "MAX",
+      status,
+      expiryDate: null,
+    });
+    assert.equal(w.tier, "FREE", `status ${status} should not retain paid tier`);
+    assert.equal(w.isPaidActive, false);
+    assert.equal(w.dailyAllowance, 25);
+  }
+});
+

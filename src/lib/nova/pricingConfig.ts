@@ -54,14 +54,14 @@ export const DEFAULT_PRICING_CONFIG: NovaPricingConfig = {
     BUILDER: {
       dailyAllocation: 950,
       monthlyAllocation: 28500,
-      monthlyPriceInr: 1799,
+      monthlyPriceInr: 499,
       rollingWindowHours: 24,
       allowRollover: false,
     },
     PRO: {
       dailyAllocation: 1900,
       monthlyAllocation: 57000,
-      monthlyPriceInr: 3499,
+      monthlyPriceInr: 1499,
       rollingWindowHours: 24,
       allowRollover: false,
     },

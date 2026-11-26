@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { prisma } from "@backend/lib/prisma";
 import { getPlanConfig, type PlanTier, PLANS } from "./plans";
-import { SessionPayload } from "./authSession";
+import type { SessionPayload } from "./authSession";
 import {
   activateCapturedPayment,
   constantTimeHexMatch,
@@ -31,9 +31,30 @@ const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "";
 const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "";
 const CASHFREE_SECRET_KEY = process.env.CASHFREE_SECRET_KEY || "";
 
+/**
+ * Resolve the calendar-month duration for a paid PRO/MAX order from the ORDER'S
+ * OWN STORED AMOUNT (a server-side snapshot captured at purchase time), NOT the
+ * current price table. This preserves the meaning of historical purchases after
+ * the ₹499 → ₹1,499 PRO price change:
+ *   - Historical PRO (₹499 = 49,900 paise) → 1 calendar month
+ *   - New PRO (₹1,499 = 149,900 paise) / MAX → 4 calendar months
+ * The returned value is only used for PRO/MAX; BUILDER keeps its fixed 30-day
+ * duration in the caller and never reaches this helper.
+ */
+function resolveExpiryMonths(plan: string, amountInPaise: number): number {
+  const normalized = (plan || "").toString().trim().toUpperCase();
+  if (normalized === "PRO" && amountInPaise === 49900) {
+    return 1; // historical ₹499 PRO: keep original one calendar month
+  }
+  return 4; // new PRO ₹1,499 and MAX both map to four calendar months
+}
+
+import { addCalendarMonths } from "./subscriptionExpiry";
 import { resolveWebhookGateway, type GatewayKind } from "./gateway";
 
 export { resolveWebhookGateway, type GatewayKind };
+export { addCalendarMonths } from "./subscriptionExpiry";
+export { resolveExpiryMonths };
 
 export interface CreateOrderParams {
   session: SessionPayload;
@@ -95,27 +116,29 @@ export class PaymentService {
       throw new Error("ACCOUNT_NOT_FOUND: Authenticated user record does not exist.");
     }
 
-    // Validate selected plan against server-controlled config
+    // Validate selected plan against server-controlled config.
+    // Only FREE, BUILDER and PRO are purchasable; MAX is a legacy alias
+    // retained for historical record/entitlement compatibility and is not
+    // offered for new orders.
     const planConfig = getPlanConfig(planId);
-    if (!planConfig || planConfig.id === "FREE") {
-      throw new Error("INVALID_PLAN: You can only purchase paid tiers (PRO or MAX).");
+    if (!planConfig || planConfig.id === "FREE" || planConfig.id === "MAX") {
+      throw new Error("INVALID_PLAN: You can only purchase paid tiers (PRO or BUILDER).");
     }
 
     // Server-authoritative amount & currency
     const amount = planConfig.amountInPaise;
     const currency = planConfig.currency;
     const orderId = `ord_mm_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
-    const isRazorpayConfigured = Boolean(
-      RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET && !RAZORPAY_KEY_ID.includes("your-")
-    );
+    // Cashfree is the ONLY gateway for new production orders. Historical Razorpay
+    // orders remain verifiable via the verifyPayment/webhook paths (untouched below).
     const useCashfree = isCashfreeConfigured(process.env);
-    const useSandbox = !useCashfree && !isRazorpayConfigured && sandboxPaymentsEnabled(process.env);
-    if (!useCashfree && !isRazorpayConfigured && !useSandbox) {
+    const useSandbox = !useCashfree && sandboxPaymentsEnabled(process.env);
+    if (!useCashfree && !useSandbox) {
       throw new Error("PAYMENT_UNAVAILABLE: No payment gateway is configured.");
     }
 
     let gatewayOrderId = orderId;
-    let gatewayType = useCashfree ? "CASHFREE" : useSandbox ? "SANDBOX" : "RAZORPAY";
+    let gatewayType = useCashfree ? "CASHFREE" : "SANDBOX";
     let cfPaymentSessionId: string | undefined;
 
     if (useCashfree) {
@@ -133,37 +156,6 @@ export class PaymentService {
       });
       gatewayOrderId = cfOrder.order_id;
       cfPaymentSessionId = cfOrder.payment_session_id;
-    } else if (isRazorpayConfigured) {
-      const authHeader = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
-      const rzpRes = await fetch("https://api.razorpay.com/v1/orders", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Basic ${authHeader}`,
-        },
-        body: JSON.stringify({
-          amount,
-          currency,
-          receipt: orderId,
-          notes: {
-            internalUserId: user.id,
-            internalUserEmail: user.email,
-            plan: planConfig.id,
-          },
-        }),
-      });
-
-      const rzpData = rzpRes.ok ? await rzpRes.json() : null;
-      if (
-        !rzpRes.ok ||
-        typeof rzpData?.id !== "string" ||
-        rzpData.amount !== amount ||
-        rzpData.currency !== currency
-      ) {
-        console.error("[Razorpay] Order creation failed:", rzpRes.status);
-        throw new Error("PAYMENT_UNAVAILABLE: Unable to create a Razorpay order.");
-      }
-      gatewayOrderId = rzpData.id;
     }
 
     // Persist PaymentOrder in Database bound to user.id and user.email
@@ -196,7 +188,7 @@ export class PaymentService {
       userEmail: user.email,
       userName: user.name || user.email.split("@")[0],
       gateway: gatewayType,
-      keyId: isRazorpayConfigured ? RAZORPAY_KEY_ID : undefined,
+      keyId: undefined,
       ...(gatewayType === "CASHFREE"
         ? {
             paymentSessionId: cfPaymentSessionId,
@@ -268,8 +260,14 @@ export class PaymentService {
     if (!planConfig) {
       throw new Error("INVALID_PLAN: Plan configuration not found.");
     }
-    if (order.amount !== planConfig.amountInPaise || order.currency !== planConfig.currency) {
-      throw new Error("INVALID_PAYMENT: Stored order amount or currency does not match the plan.");
+    // Validate against the ORDER'S OWN STORED SNAPSHOT, not the current price
+    // table. The order amount is captured server-side at creation time, so a
+    // historical PRO (₹499 / 49,900 paise) order remains verifiable after the
+    // pricing change without being mistaken for a new ₹1,499 purchase. The
+    // gateway capture (cashfreeSuccessMatchesOrder / Razorpay) below always
+    // re-confirms the paid amount equals the stored order amount.
+    if (order.currency !== planConfig.currency || !(order.amount > 0)) {
+      throw new Error("INVALID_PAYMENT: Stored order amount or currency is invalid.");
     }
 
     if (order.gateway === "SANDBOX") {
@@ -328,7 +326,7 @@ export class PaymentService {
   }
 
   private static async activateVerifiedOrder(
-    order: { id: string; userId: string; orderId: string; plan: string },
+    order: { id: string; userId: string; orderId: string; plan: string; amount: number },
     gatewayPaymentId: string,
     gatewaySignature?: string
   ) {
@@ -337,7 +335,15 @@ export class PaymentService {
       throw new Error("INVALID_PLAN: Plan configuration not found.");
     }
     const now = new Date();
-    const expiryDate = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    // Builder preserves its legacy fixed 30-day duration. Paid Pro/MAX duration
+    // is resolved from the ORDER'S STORED AMOUNT so a historical PRO (₹499)
+    // purchase keeps its original one calendar month instead of being silently
+    // extended to four months, while new PRO (₹1,499) and MAX map to four
+    // calendar months.
+    const expiryDate =
+      planConfig.id === "BUILDER"
+        ? new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000)
+        : addCalendarMonths(now, resolveExpiryMonths(order.plan, order.amount));
     const creditsToGrant = planConfig.aiCreditsPerMonth;
 
     return prisma.$transaction(async (transaction) =>

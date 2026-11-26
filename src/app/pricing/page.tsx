@@ -68,7 +68,7 @@ export default function PricingPage() {
 
         {/* Pricing Cards Grid */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-8 items-stretch mb-20">
-          {(["FREE", "PRO", "MAX"] as PlanTier[]).map((tierKey) => {
+          {(["FREE", "BUILDER", "PRO"] as PlanTier[]).map((tierKey) => {
             const plan = PLANS[tierKey];
             const isCurrent = currentPlan === tierKey;
             const isHighlighted = plan.highlighted;

@@ -8,7 +8,8 @@ export interface PlanConfig {
   price: number; // in INR
   amountInPaise: number; // 1 INR = 100 paise
   currency: "INR";
-  billingPeriod: "monthly" | "lifetime";
+  billingPeriod: string;
+  accessMonths: number;
   dailyAllocation: number;
   aiCreditsPerMonth: number;
   highlighted?: boolean;
@@ -18,13 +19,14 @@ export interface PlanConfig {
 export const PLANS: Record<PlanTier, PlanConfig> = {
   FREE: {
     id: "FREE",
-    name: "Free Community Tier",
+    name: "Free Trial Tier",
     badge: "Community",
     description: "Full access to foundational engineering challenges and Socratic mentor sandbox.",
     price: 0,
     amountInPaise: 0,
     currency: "INR",
     billingPeriod: "lifetime",
+    accessMonths: 0,
     dailyAllocation: 25,
     aiCreditsPerMonth: 750,
     features: [
@@ -41,10 +43,11 @@ export const PLANS: Record<PlanTier, PlanConfig> = {
     name: "Builder Tier",
     badge: "Most Popular",
     description: "For serious student engineers aiming for top-tier startup roles.",
-    price: 1799,
-    amountInPaise: 179900,
+    price: 499,
+    amountInPaise: 49900,
     currency: "INR",
-    billingPeriod: "monthly",
+    billingPeriod: "30 days",
+    accessMonths: 1,
     dailyAllocation: 950,
     aiCreditsPerMonth: 28500,
     highlighted: true,
@@ -64,10 +67,11 @@ export const PLANS: Record<PlanTier, PlanConfig> = {
     name: "Pro Tier",
     badge: "Elite",
     description: "Full unconstrained power for founders and senior engineering candidates.",
-    price: 3499,
-    amountInPaise: 349900,
+    price: 1499,
+    amountInPaise: 149900,
     currency: "INR",
-    billingPeriod: "monthly",
+    billingPeriod: "4 months",
+    accessMonths: 4,
     dailyAllocation: 1900,
     aiCreditsPerMonth: 57000,
     features: [
@@ -87,10 +91,11 @@ export const PLANS: Record<PlanTier, PlanConfig> = {
     name: "Max Founder Tier (Legacy)",
     badge: "Elite",
     description: "Legacy tier mapped to Pro capabilities.",
-    price: 3499,
-    amountInPaise: 349900,
+    price: 1499,
+    amountInPaise: 149900,
     currency: "INR",
-    billingPeriod: "monthly",
+    billingPeriod: "4 months",
+    accessMonths: 4,
     dailyAllocation: 1900,
     aiCreditsPerMonth: 57000,
     features: [

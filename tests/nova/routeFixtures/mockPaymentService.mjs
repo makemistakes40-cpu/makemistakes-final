@@ -9,6 +9,23 @@ export class PaymentService {
     this.successfulDeductions = 0;
     this.mockResult = null;
     this.mockHandler = null;
+    this.getAccountSubscriptionValue = {
+      plan: "FREE",
+      status: "ACTIVE",
+      expiryDate: null,
+      isPaid: false,
+    };
+  }
+
+  static getAccountSubscriptionValue = {
+    plan: "FREE",
+    status: "ACTIVE",
+    expiryDate: null,
+    isPaid: false,
+  };
+
+  static async getAccountSubscription() {
+    return this.getAccountSubscriptionValue;
   }
 
   static async deductAiCredit(userId, amount = 1, reason = "nova_chat") {
