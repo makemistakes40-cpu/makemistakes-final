@@ -204,6 +204,75 @@ test("getOrderPayments returns payment list; distinguishes statuses", async () =
   }
 });
 
+test("getOrderPayments handles envelope-wrapped { payments: [...] } response (documented shape)", async () => {
+  // The root cause of PAYMENT_UNVERIFIED: some Cashfree responses wrap the
+  // payment list in an object instead of returning a bare array. A bare-array
+  // assumption silently returns [] and rejects a real captured payment.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      payments: [
+        { cf_payment_id: "pay_env_1", payment_status: "SUCCESS", payment_amount: 1799, payment_currency: "INR" },
+      ],
+    }),
+  });
+  try {
+    const cf = new CashfreeClient({ CASHFREE_APP_ID: "app", CASHFREE_SECRET_KEY: "secret" });
+    const payments = await cf.getOrderPayments("cf_order_env");
+    assert.equal(payments.length, 1);
+    assert.equal(payments[0].cf_payment_id, "pay_env_1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("getOrderPayments handles { data: [...] } envelope response", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      data: [
+        { cf_payment_id: "pay_data_1", payment_status: "SUCCESS", payment_amount: 1799, payment_currency: "INR" },
+      ],
+    }),
+  });
+  try {
+    const cf = new CashfreeClient({ CASHFREE_APP_ID: "app", CASHFREE_SECRET_KEY: "secret" });
+    const payments = await cf.getOrderPayments("cf_order_data");
+    assert.equal(payments.length, 1);
+    assert.equal(payments[0].cf_payment_id, "pay_data_1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("getOrderPayments returns [] for a 200 with no payment list", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({ message: "no payments" }),
+  });
+  try {
+    const cf = new CashfreeClient({ CASHFREE_APP_ID: "app", CASHFREE_SECRET_KEY: "secret" });
+    const payments = await cf.getOrderPayments("cf_order_empty");
+    assert.equal(payments.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("getOrderPayments throws PAYMENT_UNVERIFIED on network/HTTP failure", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: false, status: 401 });
+  try {
+    const cf = new CashfreeClient({ CASHFREE_APP_ID: "app", CASHFREE_SECRET_KEY: "secret" });
+    await assert.rejects(() => cf.getOrderPayments("cf_order_fail"), /PAYMENT_UNVERIFIED/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 // --- amount/currency + gateway resolution helpers --------------------------
 
 import {

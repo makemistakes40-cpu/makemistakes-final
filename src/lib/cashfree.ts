@@ -171,14 +171,33 @@ export class CashfreeClient {
       throw new Error("PAYMENT_UNVERIFIED: Cashfree could not confirm the payment.");
     }
     const data = await res.json();
-    const isArray = Array.isArray(data);
-    if (!isArray && data && typeof data === "object") {
+    type PaymentRecord = {
+      cf_payment_id: string;
+      payment_status: string;
+      payment_amount: number;
+      payment_currency: string;
+      payment_time?: string;
+    };
+    // Cashfree documents the payments list as a bare JSON array, but some
+    // flows wrap it in an envelope object ({ payments: [...] } or
+    // { data: [...] }). Accept both documented shapes so a real captured
+    // payment is never dropped by a wrong shape assumption. The strict
+    // status / amount / currency validation performed by the caller is
+    // unchanged and still applies to every element returned here.
+    let payments: PaymentRecord[] = [];
+    if (Array.isArray(data)) {
+      payments = data as PaymentRecord[];
+    } else if (data && typeof data === "object") {
+      const record = data as Record<string, unknown>;
+      const wrapped = record.payments ?? record.data;
+      if (Array.isArray(wrapped)) payments = wrapped as PaymentRecord[];
+    }
+    if (payments.length === 0 && data && typeof data === "object" && !Array.isArray(data)) {
       console.warn(
         `[Cashfree-DIAG] getOrderPayments HTTP ${res.status} non-array ` +
           `topLevelKeys=${Object.keys(data).join(",")}`
       );
     }
-    const payments = isArray ? data : [];
     for (const p of payments) {
       console.warn(
         `[Cashfree-DIAG] order ${orderId} payment cf_id=${p?.cf_payment_id ?? ""} ` +
