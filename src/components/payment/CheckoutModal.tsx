@@ -708,7 +708,7 @@ export default function CheckoutModal({
                 Continue to Secure Checkout
               </h2>
               <p className="text-xs text-zinc-400 mt-1">
-                Payment details are handled by Razorpay. MakeMistakes activates your plan only after Razorpay confirms a captured payment.
+                Your payment will be securely processed by Cashfree. MakeMistakes activates your subscription only after successful payment verification.
               </p>
             </div>
 
@@ -717,7 +717,7 @@ export default function CheckoutModal({
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-teal-400 opacity-75"></span>
                 <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-teal-500"></span>
               </span>
-              <span>Payment options and approval are provided by Razorpay.</span>
+              <span>Payment processing and payment options are securely provided by Cashfree.</span>
             </div>
 
             {/* Action Buttons */}
@@ -727,7 +727,7 @@ export default function CheckoutModal({
                 className="w-full py-3.5 rounded-2xl bg-teal-600 hover:bg-teal-500 text-white font-semibold text-xs sm:text-sm transition-all shadow-lg shadow-teal-600/20 flex items-center justify-center gap-2 cursor-pointer"
               >
                 <CheckCircle2 className="w-4 h-4" />
-                <span>{orderData?.gateway === "SANDBOX" ? "Complete test payment" : "Open secure checkout"}</span>
+                <span>{orderData?.gateway === "SANDBOX" ? "Complete test payment" : "Open Cashfree Checkout"}</span>
               </button>
 
               <button
@@ -735,7 +735,7 @@ export default function CheckoutModal({
                 className="w-full py-2.5 rounded-xl border border-teal-500/30 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 font-mono text-xs transition-colors cursor-pointer flex items-center justify-center gap-1.5"
               >
                 <Zap className="w-3.5 h-3.5 text-amber-400" />
-                <span>{orderData?.gateway === "SANDBOX" ? "Simulate successful test payment" : "Pay securely with Razorpay"}</span>
+                <span>{orderData?.gateway === "SANDBOX" ? "Simulate successful test payment" : "Pay securely with Cashfree"}</span>
               </button>
             </div>
           </div>
@@ -764,7 +764,7 @@ export default function CheckoutModal({
                 Pay by Card
               </h2>
               <p className="text-xs text-zinc-400 mt-1">
-                Enter card details only in Razorpay’s secure checkout. MakeMistakes does not collect or store card numbers or CVV.
+                Enter card details only in Cashfree’s secure checkout. MakeMistakes does not collect or store card numbers or CVV.
               </p>
             </div>
 
@@ -801,7 +801,7 @@ export default function CheckoutModal({
                 Choose your payment method securely
               </h2>
               <p className="text-xs text-zinc-400 mt-1">
-                Select net banking or another supported method in the Razorpay checkout. Payment credentials are not entered on this site.
+                Select net banking or another supported method in the Cashfree checkout. Payment credentials are not entered on this site.
               </p>
             </div>
 
