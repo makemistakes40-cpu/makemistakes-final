@@ -14,7 +14,7 @@ import { getPlanConfig, type PlanTier } from "./plans";
 
 // Cashfree supports two environments. Test/sandbox uses a distinct API host and
 // hosted-checkout host from production.
-const CASHFREE_API_BASE = {
+export const CASHFREE_API_BASE = {
   TEST: "https://sandbox.cashfree.com/pg",
   PRODUCTION: "https://api.cashfree.com/pg",
 } as const;
@@ -171,7 +171,14 @@ export class CashfreeClient {
       throw new Error("PAYMENT_UNVERIFIED: Cashfree could not confirm the payment.");
     }
     const data = await res.json();
-    const payments = Array.isArray(data) ? data : [];
+    const isArray = Array.isArray(data);
+    if (!isArray && data && typeof data === "object") {
+      console.warn(
+        `[Cashfree-DIAG] getOrderPayments HTTP ${res.status} non-array ` +
+          `topLevelKeys=${Object.keys(data).join(",")}`
+      );
+    }
+    const payments = isArray ? data : [];
     for (const p of payments) {
       console.warn(
         `[Cashfree-DIAG] order ${orderId} payment cf_id=${p?.cf_payment_id ?? ""} ` +

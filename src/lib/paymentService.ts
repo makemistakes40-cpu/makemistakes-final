@@ -13,6 +13,7 @@ import {
   CashfreeClient,
   isCashfreeConfigured,
   getCashfreeEnv,
+  CASHFREE_API_BASE,
   verifyCashfreeWebhookSignature,
   resolvePaidPlan,
   cashfreeSuccessMatchesOrder,
@@ -143,6 +144,11 @@ export class PaymentService {
 
     if (useCashfree) {
       const cf = new CashfreeClient(process.env);
+      console.warn(
+        `[Cashfree-DIAG] createOrder env=${getCashfreeEnv(process.env)} ` +
+          `baseUrl=${CASHFREE_API_BASE[getCashfreeEnv(process.env)]} ` +
+          `orderId=${orderId}`
+      );
       const cfOrder = await cf.createOrder({
         orderId,
         amount,
@@ -292,6 +298,11 @@ export class PaymentService {
         throw new Error("PAYMENT_UNAVAILABLE: Cashfree is not configured.");
       }
       const cf = new CashfreeClient(process.env);
+      console.warn(
+        `[Cashfree-DIAG] verify env=${getCashfreeEnv(process.env)} ` +
+          `baseUrl=${CASHFREE_API_BASE[getCashfreeEnv(process.env)]} ` +
+          `orderId=${order.orderId} gatewayOrderId=${order.gatewayOrderId}`
+      );
       const payments = await cf.getOrderPayments(order.gatewayOrderId || "");
       // TEMP DIAGNOSTIC: report which sub-condition fails per payment (no PII).
       for (const p of payments) {
