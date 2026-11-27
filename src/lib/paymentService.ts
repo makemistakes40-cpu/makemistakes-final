@@ -223,8 +223,14 @@ export class PaymentService {
     });
 
     if (!order) {
+      console.warn(`[Cashfree-DIAG] order ${orderId} NOT FOUND`);
       throw new Error("ORDER_NOT_FOUND: Payment order does not exist.");
     }
+    console.warn(
+      `[Cashfree-DIAG] order ${orderId} found; amountPaise=${order.amount} ` +
+        `currency=${order.currency} gateway=${order.gateway} ` +
+        `gatewayOrderId=${order.gatewayOrderId} status=${order.status}`
+    );
 
     // STRICT USER ISOLATION: Order must belong to authenticated account ID
     if (order.userId !== session.userId) {
@@ -287,6 +293,22 @@ export class PaymentService {
       }
       const cf = new CashfreeClient(process.env);
       const payments = await cf.getOrderPayments(order.gatewayOrderId || "");
+      // TEMP DIAGNOSTIC: report which sub-condition fails per payment (no PII).
+      for (const p of payments) {
+        const statusOk = p.payment_status === "SUCCESS";
+        const amountOk =
+          typeof p.payment_amount === "number" &&
+          Number.isFinite(p.payment_amount) &&
+          p.payment_amount >= 0 &&
+          Math.round(p.payment_amount * 100) === order.amount;
+        const currencyOk = p.payment_currency === order.currency;
+        console.warn(
+          `[Cashfree-DIAG] order ${order.orderId} check status=${statusOk} ` +
+            `(got "${p.payment_status}", want "SUCCESS") amount=${amountOk} ` +
+            `(got ${p.payment_amount}, wantPaise ${order.amount}) currency=${currencyOk} ` +
+            `(got "${p.payment_currency}", want "${order.currency}")`
+        );
+      }
       const captured = payments.find(
         (p) => p.payment_status === "SUCCESS" && cashfreeSuccessMatchesOrder(p, order)
       );

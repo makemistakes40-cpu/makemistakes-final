@@ -163,11 +163,26 @@ export class CashfreeClient {
       headers: this.headers(),
       dispatcher: cashfreeAgent,
     } as CashfreeRequestInit);
+    // TEMP DIAGNOSTIC: HTTP status + sanitized payment summary (no secrets/PII).
     if (!res.ok) {
+      console.warn(
+        `[Cashfree-DIAG] getOrderPayments HTTP ${res.status} for order ${orderId}`
+      );
       throw new Error("PAYMENT_UNVERIFIED: Cashfree could not confirm the payment.");
     }
     const data = await res.json();
-    return Array.isArray(data) ? data : [];
+    const payments = Array.isArray(data) ? data : [];
+    for (const p of payments) {
+      console.warn(
+        `[Cashfree-DIAG] order ${orderId} payment cf_id=${p?.cf_payment_id ?? ""} ` +
+          `status=${p?.payment_status ?? ""} amount=${p?.payment_amount ?? ""} ` +
+          `currency=${p?.payment_currency ?? ""}`
+      );
+    }
+    console.warn(
+      `[Cashfree-DIAG] getOrderPayments HTTP ${res.status} OK; ${payments.length} payment(s)`
+    );
+    return payments;
   }
 }
 
