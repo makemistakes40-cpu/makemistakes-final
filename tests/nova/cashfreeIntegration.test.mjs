@@ -113,6 +113,56 @@ test("duplicate webhook with same payload+timestamp verifies (idempotent)", () =
   }
 });
 
+// --- millisecond (13-digit) timestamp handling ------------------------------
+
+// Cashfree may send x-webhook-timestamp as milliseconds (13 digits), e.g.
+// 1795815896543. The signature is computed over the ORIGINAL string, while the
+// replay window compares normalized seconds.
+const MS = () => String(Date.now());
+
+test("webhook verifies a valid 13-digit millisecond timestamp (signature uses original string)", () => {
+  const raw = JSON.stringify({ type: "PAYMENT_SUCCESS", data: { order_id: "ord1" } });
+  const secret = "s";
+  const tsMs = MS();
+  const sig = signWebhook(raw, secret, tsMs); // signed over the raw ms string
+  assert.equal(verifyCashfreeWebhookSignature(raw, sig, secret, tsMs), true);
+});
+
+test("webhook rejects a bad signature with a millisecond timestamp", () => {
+  const raw = JSON.stringify({ type: "PAYMENT_SUCCESS" });
+  const secret = "s";
+  const tsMs = MS();
+  const sig = signWebhook(raw, secret, tsMs);
+  assert.equal(verifyCashfreeWebhookSignature(raw, "bm90LXRoZS1yaWdodA==", secret, tsMs), false);
+  assert.equal(verifyCashfreeWebhookSignature(raw, sig, "wrong", tsMs), false);
+});
+
+test("webhook rejects an expired millisecond timestamp (outside replay window)", () => {
+  const raw = "{}";
+  const secret = "s";
+  const expiredMs = String(Date.now() - 10_000 * 1000); // 10,000s ago
+  const sig = signWebhook(raw, secret, expiredMs);
+  assert.equal(verifyCashfreeWebhookSignature(raw, sig, secret, expiredMs), false);
+});
+
+test("webhook rejects a future millisecond timestamp outside the allowed window", () => {
+  const raw = "{}";
+  const secret = "s";
+  const futureMs = String(Date.now() + 700 * 1000); // 700s ahead > 600s window
+  const sig = signWebhook(raw, secret, futureMs);
+  assert.equal(verifyCashfreeWebhookSignature(raw, sig, secret, futureMs), false);
+});
+
+test("webhook HMAC ties to the original unmodified millisecond string", () => {
+  const raw = "{}";
+  const secret = "s";
+  const tsMs = MS();
+  const sig = signWebhook(raw, secret, tsMs);
+  // Tampering with even one digit of the ms timestamp changes the signed data.
+  const tamperedTs = String(Number(tsMs) + 1);
+  assert.equal(verifyCashfreeWebhookSignature(raw, sig, secret, tamperedTs), false);
+});
+
 // --- order creation (mocked fetch) ---------------------------------------
 
 test("createOrder posts to v4 orders endpoint and returns session id", async () => {

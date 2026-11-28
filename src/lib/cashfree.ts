@@ -234,7 +234,11 @@ export function verifyCashfreeWebhookSignature(
   const ts = timestamp ? Number(timestamp) : Number.NaN;
   if (timestamp && !Number.isFinite(ts)) return false;
   if (Number.isFinite(ts)) {
-    const age = Math.abs(Date.now() / 1000 - ts);
+    // Cashfree may send the timestamp in milliseconds (13-digit). Normalize
+    // to seconds before comparing to the replay window so the check is in a
+    // consistent unit. The original string is preserved for the HMAC below.
+    const tsSeconds = ts > 1e12 ? ts / 1000 : ts;
+    const age = Math.abs(Date.now() / 1000 - tsSeconds);
     if (age > maxAgeSeconds) return false;
   }
   // Cashfree signs the concatenation of timestamp and raw body (no separator).
